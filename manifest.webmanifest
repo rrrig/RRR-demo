@@ -1,0 +1,15 @@
+{
+  "id": "./",
+  "name": "ИГНИС ПРО — инженерный архив",
+  "short_name": "ИГНИС ПРО",
+  "lang": "ru",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#0f1821",
+  "theme_color": "#0f1821",
+  "icons": [
+    {"src": "assets/ignis-pro-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any"},
+    {"src": "assets/ignis-pro-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any"}
+  ]
+}
