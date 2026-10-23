@@ -1,4 +1,4 @@
-import * as store from './store.js?v=0.6.0';
+import * as store from './store.js?v=0.6.1';
 
 const $ = id => document.getElementById(id);
 const esc = value => String(value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -100,8 +100,8 @@ function showError(error, prefix='Операция не выполнена') {
   if(error?.code==='STALE') stale=true;
   if(error?.code==='UNCERTAIN'){stale=true;uncertain=true;}
   let detail=error?.message||String(error);
-  if(/blob.*(?:prepar|serializ)|(?:prepar|serializ).*blob/i.test(detail)) {reloadSuggested=true;detail='Safari не смог подготовить вложение к сохранению прежним способом. Проверь, что в шапке указана R06, закрой прежнюю вкладку и открой приложение заново. Затем повторно выбери тот же файл резервной копии. Не очищай данные Safari.';}
-  else if(error?.name==='DataCloneError') {reloadSuggested=true;detail='Браузер не смог подготовить данные для локального сохранения. Проверь версию R06 в шапке и открой приложение заново. Файл резервной копии можно выбрать повторно; не очищай данные браузера.';}
+  if(/blob.*(?:prepar|serializ)|(?:prepar|serializ).*blob/i.test(detail)) {reloadSuggested=true;detail='Safari не смог подготовить вложение к сохранению прежним способом. Проверь, что в шапке указана R06.1, закрой прежнюю вкладку и открой приложение заново. Затем повторно выбери тот же файл резервной копии. Не очищай данные Safari.';}
+  else if(error?.name==='DataCloneError') {reloadSuggested=true;detail='Браузер не смог подготовить данные для локального сохранения. Проверь версию R06.1 в шапке и открой приложение заново. Файл резервной копии можно выбрать повторно; не очищай данные браузера.';}
   else if(error?.name==='QuotaExceededError') detail='На устройстве недостаточно доступного места. Данные операции не сохранены. Освободи место и попробуй ещё раз.';
   else if(error?.name==='SecurityError') detail='Браузер запретил доступ к локальному хранилищу. Проверь настройки Safari.';
   else if(error?.name==='UnknownError'||error?.name==='InvalidStateError') {reloadSuggested=true;detail='Браузер не смог выполнить операцию с локальным хранилищем. Закрой другие вкладки приложения и перечитай каталог перед повторной попыткой. Исходный файл резервной копии не изменялся. Не очищай данные браузера.';}
@@ -117,7 +117,7 @@ async function refreshPrevious() {
     const result=await store.getPreviousInfo();
     if(request!==previousRequest)return;
     previous=result;
-    $('previousInfo').textContent=previous.available ? `${previous.projects} проектов · ${previous.documents} документов · ${previous.revisions} редакций. Восстановление заменит текущий архив.` : 'Снимка пока нет. Он появится перед первым восстановлением, переносом R04 или добавлением новых записей из каталога.';
+    $('previousInfo').textContent=previous.available ? `${previous.projects} проектов · ${previous.documents} документов · ${previous.revisions} редакций. Восстановление заменит весь текущий архив, включая файлы и последующие изменения.` : 'Снимка пока нет. Он появится перед первым удалением, восстановлением, переносом R04 или добавлением новых записей из каталога.';
   } catch(error) {
     if(request!==previousRequest)return;
     previous=null;
@@ -141,8 +141,26 @@ function rebuildIndex() {
 function sourceMarkup(revision) {
   const source=revision.source;
   if(source?.kind!=='chatgpt-library'||!/^libfile_[a-zA-Z0-9]+$/.test(source.libraryFileId))return '';
-  const url='https://chatgpt.com/api/library/files/'+encodeURIComponent(source.libraryFileId)+'/download';
-  return `<div class="source-note"><strong>${revision.attachment?'Исходник в ChatGPT':'Исходник в ChatGPT · файл ещё не сохранён в приложении'}</strong><div style="overflow-wrap:anywhere;margin-top:4px">${esc(source.fileName)}</div><a class="source-link" href="${url}" target="_blank" rel="noopener noreferrer">Открыть исходник в ChatGPT ↗</a>${revision.attachment?'':'<div class="muted" style="font-size:11px;margin-top:5px">Скачай исходник и прикрепи к этой редакции. Ссылка сама по себе не является сохранённым вложением.</div>'}</div>`;
+  return `<div class="source-note"><strong>${revision.attachment?'Исходник в ChatGPT':'Исходник в ChatGPT · файл ещё не сохранён в приложении'}</strong><div style="overflow-wrap:anywhere;margin-top:4px">${esc(source.fileName)}</div>${revision.attachment?'':'<div class="muted" style="font-size:11px;margin-top:5px">Найди этот файл в самом ChatGPT и скачай на устройство. Затем нажми «Прикрепить файл» у этой редакции. Карточка исходника сама по себе не содержит файл.</div>'}</div>`;
+}
+async function deleteItem(type,id) {
+  if(busy||stale||!snapshot)return;
+  const item=(type==='project'?snapshot.projects:snapshot.documents).find(item=>item.id===id);
+  if(!item)return;
+  const documents=type==='project'?(index.documentsByProject.get(id)||[]):[item];
+  const revisions=documents.flatMap(doc=>index.revisionsByDocument.get(doc.id)||[]);
+  const files=revisions.filter(revision=>revision.attachment);
+  const volume=files.reduce((sum,revision)=>sum+revision.attachment.size,0);
+  const active=snapshot.documents.find(doc=>doc.id===activeDocument);
+  const clearsDraft=!!active&&(type==='project'?active.projectId===id:active.id===id);
+  const title=type==='project'?'проект':'документ';
+  const confirmation=`Удалить ${title} «${item.name}» из приложения?\nДокументов: ${documents.length}; редакций: ${revisions.length}; сохранённых файлов: ${files.length} (${bytes(volume)}).\nИсходники ChatGPT останутся. Повторный импорт каталога может вернуть карточки.\nСохранится полный снимок с файлами. В разделе «Копия» можно вернуть ВЕСЬ архив, заменив последующие изменения. Снимок один: следующее удаление, импорт или восстановление заменит его.${clearsDraft?'\nОткрытая форма этого документа будет очищена.':''}`;
+  if(!confirm(confirmation))return;
+  return run(expectedVersion=>type==='project'?store.deleteProject({projectId:id,expectedVersion}):store.deleteDocument({documentId:id,expectedVersion}),type==='project'?'Проект удалён из приложения. Предыдущий полный архив сохранён в разделе «Копия».':'Документ со всеми редакциями удалён из приложения. Предыдущий полный архив сохранён в разделе «Копия».',()=>{
+    if(clearsDraft)resetRevisionForm();
+    if(type==='project'&&$('projectFilter').value===id)$('projectFilter').value='';
+    documentPage=1;
+  });
 }
 function openRename(type,id,button) {
   if(busy||stale||!snapshot)return;
@@ -172,7 +190,7 @@ function render() {
     const groups=index.documentsByProject.get(p.id)||[];
     let revisions=0,attached=0,sources=0;
     for(const group of groups)for(const revision of index.revisionsByDocument.get(group.id)||[]){revisions++;if(revision.attachment)attached++;if(revision.source&&!revision.attachment)sources++;}
-    return `<article class="project-card"><div class="project-title">${esc(p.name)}</div><div class="project-meta">Документов: ${groups.length} · Редакций: ${revisions}<br>Сохранённых файлов: ${attached} · Исходников без файла: ${sources}</div><div class="actions"><button class="small primary" data-project="${esc(p.id)}">Открыть</button><button class="small ghost" data-rename-project="${esc(p.id)}" aria-label="Переименовать проект ${esc(p.name)}">Переименовать</button></div></article>`;
+    return `<article class="project-card"><div class="project-title">${esc(p.name)}</div><div class="project-meta">Документов: ${groups.length} · Редакций: ${revisions}<br>Сохранённых файлов: ${attached} · Исходников без файла: ${sources}</div><div class="actions"><button class="small primary" data-project="${esc(p.id)}">Открыть</button><button class="small ghost" data-rename-project="${esc(p.id)}" aria-label="Переименовать проект ${esc(p.name)}">Переименовать</button><button class="small danger" data-delete-project="${esc(p.id)}" aria-label="Удалить проект ${esc(p.name)}">Удалить</button></div></article>`;
   }).join(''):'<div class="empty"><strong>Начни с первого проекта</strong><p>Собери документы и редакции одной конструкции в общем рабочем пространстве.</p></div>';
   fillProjects('docProject');fillProjects('projectFilter',true);
   if(activeDocument) {
@@ -181,7 +199,7 @@ function render() {
     else {activeDocument=null;$('revisionFormLabel').textContent='Документ отсутствует в перечитанном каталоге';$('revisionFormTitle').textContent='Черновик редакции';$('cancelRevision').hidden=false;}
   }
   renderDocuments();
-  $('backupStats').innerHTML=`<div><strong>${snapshot.projects.length}</strong><span>проектов</span></div><div><strong>${snapshot.revisions.length}</strong><span>редакций</span></div><div><strong>${attachmentCount()}</strong><span>сохранённых файлов · ${bytes(attachmentSize())}</span></div><div><strong>${snapshot.revisions.filter(r=>r.source).length}</strong><span>ссылок на исходники</span></div>`;
+  $('backupStats').innerHTML=`<div><strong>${snapshot.projects.length}</strong><span>проектов</span></div><div><strong>${snapshot.revisions.length}</strong><span>редакций</span></div><div><strong>${attachmentCount()}</strong><span>сохранённых файлов · ${bytes(attachmentSize())}</span></div><div><strong>${snapshot.revisions.filter(r=>r.source).length}</strong><span>карточек исходников</span></div>`;
   $('eventList').innerHTML=snapshot.events?.length?snapshot.events.map(event=>`<div class="revision"><div style="overflow-wrap:anywhere">${esc(event.text)}</div><div class="muted" style="font-size:11px;margin-top:4px">${esc(/^\d{4}-\d{2}-\d{2}T/.test(event.date)?date(event.date):event.date)}</div></div>`).join(''):'<div class="empty"><strong>Журнал пока пуст</strong><p>Здесь появятся события работы с архивом.</p></div>';
   controls();
 }
@@ -205,7 +223,7 @@ function renderDocuments() {
     const revisions=(index.revisionsByDocument.get(group.id)||[]).map((r,i)=>({...r,order:i})).sort((a,b)=>Date.parse(b.createdAt)-Date.parse(a.createdAt)||b.order-a.order);
     const latestUpload=revisions.find(r=>r.attachment);
     const pname=index.projectNames.get(group.projectId)||'';
-    return `<article class="doc-card"><div class="doc-title"><div class="title-line"><div><h3>${esc(group.name)}</h3><div class="muted">${esc(pname)} · ${revisions.length} редакций</div></div><span class="format">${esc(group.format)}</span></div></div>${revisions.map(r=>`<div class="revision"><div class="revision-top"><div><span class="revision-code">${esc(r.revision)}</span><div class="badges">${r.id===revisions[0]?.id?'<span class="badge">Последняя зарегистрированная</span>':''}${r.id===latestUpload?.id?'<span class="badge gold">Последняя с файлом</span>':''}${r.status==='Разрешено к выдаче'?'<span class="badge green">Выдача: отметка пользователя</span>':''}</div></div><label class="status-control-wrap"><span class="muted" style="font-size:10px">Статус пользователя</span><select class="status-control" aria-label="Статус ${esc(r.revision)}" data-action="status" data-id="${esc(r.id)}">${store.STATUSES.map(status=>`<option${r.status===status?' selected':''}${status==='Разрешено к выдаче'&&!r.attachment?' disabled':''}>${esc(status)}</option>`).join('')}</select></label></div><div class="muted" style="font-size:11px;margin-bottom:8px">Зарегистрировано ${esc(date(r.createdAt))}</div>${sourceMarkup(r)}${r.attachment?`<div class="file-name">${esc(r.attachment.name)}</div><div class="file-meta">${bytes(r.attachment.size)} · Файл закреплён за редакцией</div><details><summary class="file-meta">Контрольная сумма SHA‑256</summary><code class="hash">${esc(r.attachment.sha256)}</code></details><div class="actions"><button class="small ghost" data-action="download" data-id="${esc(r.id)}">Скачать файл</button></div>`:'<div class="muted">Файл ещё не прикреплён.</div><div class="actions"><button class="small ghost" data-action="attach" data-id="'+esc(r.id)+'">Прикрепить файл</button></div>'}</div>`).join('')}<div class="doc-bottom"><button class="small ghost" data-action="newRevision" data-id="${esc(group.id)}">+ Новая редакция</button><button class="small ghost" data-action="renameDocument" data-id="${esc(group.id)}">Переименовать</button></div></article>`;
+    return `<article class="doc-card"><div class="doc-title"><div class="title-line"><div><h3>${esc(group.name)}</h3><div class="muted">${esc(pname)} · ${revisions.length} редакций</div></div><span class="format">${esc(group.format)}</span></div></div>${revisions.map(r=>`<div class="revision"><div class="revision-top"><div><span class="revision-code">${esc(r.revision)}</span><div class="badges">${r.id===revisions[0]?.id?'<span class="badge">Последняя зарегистрированная</span>':''}${r.id===latestUpload?.id?'<span class="badge gold">Последняя с файлом</span>':''}${r.status==='Разрешено к выдаче'?'<span class="badge green">Выдача: отметка пользователя</span>':''}</div></div><label class="status-control-wrap"><span class="muted" style="font-size:10px">Статус пользователя</span><select class="status-control" aria-label="Статус ${esc(r.revision)}" data-action="status" data-id="${esc(r.id)}">${store.STATUSES.map(status=>`<option${r.status===status?' selected':''}${status==='Разрешено к выдаче'&&!r.attachment?' disabled':''}>${esc(status)}</option>`).join('')}</select></label></div><div class="muted" style="font-size:11px;margin-bottom:8px">Зарегистрировано ${esc(date(r.createdAt))}</div>${sourceMarkup(r)}${r.attachment?`<div class="file-name">${esc(r.attachment.name)}</div><div class="file-meta">${bytes(r.attachment.size)} · Файл закреплён за редакцией</div><details><summary class="file-meta">Контрольная сумма SHA‑256</summary><code class="hash">${esc(r.attachment.sha256)}</code></details><div class="actions"><button class="small ghost" data-action="download" data-id="${esc(r.id)}">Скачать файл</button></div>`:'<div class="muted">Файл ещё не прикреплён.</div><div class="actions"><button class="small ghost" data-action="attach" data-id="'+esc(r.id)+'">Прикрепить файл</button></div>'}</div>`).join('')}<div class="doc-bottom"><button class="small ghost" data-action="newRevision" data-id="${esc(group.id)}">+ Новая редакция</button><button class="small ghost" data-action="renameDocument" data-id="${esc(group.id)}">Переименовать</button><button class="small danger" data-action="deleteDocument" data-id="${esc(group.id)}" aria-label="Удалить документ ${esc(group.name)}">Удалить</button></div></article>`;
   }).join(''):`<div class="empty"><strong>${snapshot.documents.length?'Ничего не найдено':'Документов пока нет'}</strong><p>${snapshot.documents.length?'Измени поиск или фильтр по проекту.':'Зарегистрируй первую редакцию и прикрепи к ней файл.'}</p></div>`;
   controls();
 }
@@ -288,6 +306,7 @@ $('addProject').addEventListener('click',()=>{
   return run(expectedVersion=>store.addProject({name,expectedVersion}),'Проект сохранён.',()=>{$('projectName').value='';});
 });
 $('projectList').addEventListener('click',event=>{
+  const deletion=event.target.closest('[data-delete-project]');if(deletion){deleteItem('project',deletion.dataset.deleteProject);return;}
   const rename=event.target.closest('[data-rename-project]');if(rename){openRename('project',rename.dataset.renameProject,rename);return;}
   const button=event.target.closest('[data-project]');if(!button||busy||stale)return;
   $('projectFilter').value=button.dataset.project;
@@ -315,6 +334,7 @@ $('documentList').addEventListener('change',event=>{
 $('documentList').addEventListener('click',async event=>{
   const button=event.target.closest('button[data-action]');if(!button||busy||stale)return;
   const id=button.dataset.id;
+  if(button.dataset.action==='deleteDocument'){await deleteItem('document',id);return;}
   if(button.dataset.action==='renameDocument'){openRename('document',id,button);return;}
   if(button.dataset.action==='newRevision') {
     const group=snapshot.documents.find(d=>d.id===id);if(!group)return;
@@ -344,7 +364,7 @@ $('exportBackup').addEventListener('click',async()=>{
   if(busy||!snapshot||stale)return;busy=true;controls();notice('Проверяем вложения и готовим полную копию…');
   try {
     const backup=await store.exportBackup();
-    download(new Blob([JSON.stringify(backup)],{type:'application/json'}),'IGNIS_PRO_R06_full_'+stamp()+'.json');
+    download(new Blob([JSON.stringify(backup)],{type:'application/json'}),'IGNIS_PRO_R06.1_full_'+stamp()+'.json');
     notice('Полная копия подготовлена: '+backup.snapshot.projects.length+' проектов, '+backup.snapshot.revisions.length+' редакций, '+backup.manifest.length+' файлов. Размеры и SHA‑256 вложений проверены. Сохрани файл вне приложения.','success');
   } catch(error){showError(error,'Не удалось подготовить копию');}
   finally{busy=false;controls();}
@@ -379,7 +399,7 @@ $('importBackup').addEventListener('click',async()=>{
 });
 $('restorePrevious').addEventListener('click',async()=>{
   if(!previous?.available||busy||stale)return;
-  if(!confirm('Вернуть предыдущее состояние архива? Текущий каталог и вложения будут заменены. Текущее состояние станет новым снимком восстановления.'))return;
+  if(!confirm('Вернуть предыдущее состояние архива? Текущий каталог и вложения будут заменены. Более поздние изменения текущего архива будут потеряны. Текущее состояние станет единственным новым снимком восстановления.'))return;
   const success=await run(async expectedVersion=>{
     startRestore('Проверяем предыдущий снимок и контрольные суммы вложений…');
     await new Promise(resolve=>setTimeout(resolve,0));
@@ -389,7 +409,7 @@ $('restorePrevious').addEventListener('click',async()=>{
 });
 $('importLegacy').addEventListener('click',()=>{
   if(busy||stale)return;
-  if(!confirm('Перенести проекты, карточки документов и журнал R04 в пустой архив R06? Прежний каталог R04 останется без изменений. Оригиналов файлов в нём нет.'))return;
+  if(!confirm('Перенести проекты, карточки документов и журнал R04 в пустой архив R06.1? Прежний каталог R04 останется без изменений. Оригиналов файлов в нём нет.'))return;
   return run(expectedVersion=>store.importLegacy({expectedVersion}),'Каталог R04 перенесён. Прежние данные не изменены. Прикрепи оригиналы файлов к нужным редакциям.');
 });
 $('legacyFile').addEventListener('change',async event=>{
@@ -408,7 +428,7 @@ $('legacyFile').addEventListener('change',async event=>{
 });
 $('importLegacyFile').addEventListener('click',()=>{
   if(!preparedLegacy||busy||stale)return;
-  if(!confirm('Перенести выбранный каталог R04 в пустой архив R06? Будут перенесены проекты, карточки документов и журнал. Исходный файл и прежний каталог не изменятся.'))return;
+  if(!confirm('Перенести выбранный каталог R04 в пустой архив R06.1? Будут перенесены проекты, карточки документов и журнал. Исходный файл и прежний каталог не изменятся.'))return;
   const raw=preparedLegacy;
   return run(expectedVersion=>store.importLegacy({expectedVersion,raw}),'Каталог из файла R04 перенесён. Прикрепи оригиналы файлов к нужным редакциям.');
 });
