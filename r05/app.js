@@ -1,11 +1,57 @@
-import * as store from './store.js';
+import * as store from './store.js?v=0.5.1';
 
 const $ = id => document.getElementById(id);
 const esc = value => String(value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const bytes = n => n < 1024 ? n+' Б' : n < 1048576 ? (n/1024).toFixed(1)+' КиБ' : (n/1048576).toFixed(1)+' МиБ';
 const date = value => new Date(value).toLocaleString('ru-RU', {day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit'});
 const stamp = () => new Date().toISOString().replace(/[:.]/g,'-');
-let snapshot = null, busy = false, stale = false, activeDocument = null, pendingAttachment = null, preparedBackup = null, preparedLegacy = null, previous = null;
+let snapshot = null, busy = false, stale = false, uncertain = false, activeDocument = null, pendingAttachment = null, preparedBackup = null, preparedLegacy = null, previous = null;
+let previousRequest=0, restoreOperation=null;
+
+function restoreText(text,kind='') {
+  $('restoreProgress').hidden=false;
+  $('restoreProgress').textContent=text;
+  $('restoreProgress').className='restore-progress'+(kind?' '+kind:'');
+}
+function updateRestoreDock() {
+  if(!restoreOperation)return;
+  const seconds=Math.floor((Date.now()-restoreOperation.started)/1000);
+  const text=restoreOperation.text+(seconds?'\nПрошло '+seconds+' с.':'');
+  restoreText(text);
+  $('operationDock').textContent=text;
+}
+function startRestore(text) {
+  if(restoreOperation)clearInterval(restoreOperation.timer);
+  restoreOperation={text,started:Date.now()};
+  restoreOperation.timer=setInterval(updateRestoreDock,1000);
+  $('operationDock').hidden=false;
+  notice(text);updateRestoreDock();
+}
+function restoreStage(progress) {
+  if(!restoreOperation)return;
+  const stages={catalogue:'Проверяем структуру и связи каталога…',base64:'Читаем содержимое вложений…',hash:'Проверяем размеры и SHA‑256 файлов…',write:'Проверки завершены. Сохраняем архив и предыдущий снимок…'};
+  const stage=typeof progress==='string'?progress:progress?.stage;
+  const count=typeof progress==='object'&&Number.isFinite(progress.total)&&progress.total>0?' ('+progress.completed+' из '+progress.total+')':'';
+  restoreOperation.text=(stages[stage]||'Восстанавливаем архив…')+count;
+  updateRestoreDock();
+}
+function finishRestore(success) {
+  if(restoreOperation)clearInterval(restoreOperation.timer);
+  restoreOperation=null;$('operationDock').hidden=true;
+  restoreText($('message').textContent,success?'success':'error');
+}
+function readText(file) {
+  return new Promise((resolve,reject)=>{
+    const reader=new FileReader();
+    let settled=false;
+    const finish=(error,value)=>{if(settled)return;settled=true;clearTimeout(timer);if(error)reject(error);else resolve(value);};
+    const timer=setTimeout(()=>{finish(Object.assign(new Error('Чтение файла заняло слишком много времени. Сохрани его полностью на iPhone и выбери заново.'),{code:'TIMEOUT'}));try{reader.abort();}catch(_){}},60000);
+    reader.onload=()=>finish(null,reader.result);
+    reader.onerror=()=>finish(reader.error||new Error('Не удалось прочитать файл.'));
+    reader.onabort=()=>finish(new Error('Чтение файла отменено.'));
+    try{reader.readAsText(file);}catch(error){finish(error);}
+  });
+}
 
 function notice(text, kind='') {
   $('message').textContent=text;
@@ -26,7 +72,10 @@ function controls() {
   $('exportBackup').disabled=busy||!snapshot||stale;
   $('backupFile').disabled=busy||!snapshot||stale;
   $('reloadCatalog').disabled=busy;
+  $('reloadRestore').disabled=busy;
   $('reloadRow').hidden=(!stale&&!!snapshot);
+  $('restoreReloadRow').hidden=!stale;
+  $('reloadHint').textContent=uncertain?'Результат записи ещё не подтверждён. Перечитай фактическое состояние перед новой операцией.':'Введённые поля останутся на экране.';
   for (const element of $('documentList').querySelectorAll('button,select')) element.disabled=disabled;
   $('docProject').disabled=busy||!!activeDocument;
   $('docName').disabled=busy||!!activeDocument;
@@ -39,17 +88,25 @@ function controls() {
 }
 function showError(error, prefix='Операция не выполнена') {
   if(error?.code==='STALE') stale=true;
+  if(error?.code==='UNCERTAIN'){stale=true;uncertain=true;}
   let detail=error?.message||String(error);
   if(error?.name==='QuotaExceededError') detail='На устройстве недостаточно доступного места. Данные операции не сохранены. Освободи место и попробуй ещё раз.';
   else if(error?.name==='SecurityError') detail='Браузер запретил доступ к локальному хранилищу. Проверь настройки Safari.';
+  if(uncertain)detail+=' Результат записи не подтверждён. Новые изменения заблокированы: нажми «Перечитать каталог», чтобы увидеть фактическое состояние.';
   notice(prefix+': '+detail,'error');
+  if(stale)restoreText($('message').textContent,'error');
   controls();
 }
 async function refreshPrevious() {
+  const request=++previousRequest;
+  previous=null;$('previousInfo').textContent='Проверяем наличие предыдущего снимка…';controls();
   try {
-    previous=await store.getPreviousInfo();
+    const result=await store.getPreviousInfo();
+    if(request!==previousRequest)return;
+    previous=result;
     $('previousInfo').textContent=previous.available ? `${previous.projects} проектов · ${previous.documents} документов · ${previous.revisions} редакций. Восстановление заменит текущий архив.` : 'Снимка пока нет. Он появится перед первым восстановлением или переносом R04.';
   } catch(error) {
+    if(request!==previousRequest)return;
     previous=null;
     $('previousInfo').textContent='Снимок недоступен: '+error.message;
   }
@@ -117,7 +174,7 @@ async function run(action, success, after) {
     if(after)after();
     preparedBackup=null;$('backupFile').value='';$('backupPreview').textContent='';
     preparedLegacy=null;$('legacyFile').value='';$('legacyPreview').textContent='';
-    render();await refreshPrevious();notice(success,'success');return true;
+    render();notice(success,'success');void refreshPrevious();return true;
   } catch(error) {showError(error);render();return false;}
   finally {busy=false;controls();}
 }
@@ -193,29 +250,40 @@ $('exportBackup').addEventListener('click',async()=>{
 $('backupFile').addEventListener('change',async event=>{
   const file=event.target.files[0];preparedBackup=null;$('backupPreview').textContent='';
   if(!file||busy){controls();return;}
-  busy=true;controls();
+  busy=true;controls();restoreText('Читаем выбранную резервную копию…');
   try {
     const maxBackup=store.MAX_BACKUP_BYTES||80*1024*1024;
     if(file.size>maxBackup)throw Error('Файл копии больше '+bytes(maxBackup));
-    const text=await file.text();
+    const text=await readText(file);
     const backup=JSON.parse(text);
     if(backup.app!=='RRR'||backup.kind!=='full'||backup.schemaVersion!==1||!Array.isArray(backup.snapshot?.projects)||!Array.isArray(backup.snapshot?.documents)||!Array.isArray(backup.snapshot?.revisions)||!Array.isArray(backup.manifest))throw Error('Это не полная резервная копия R05. Для каталога R04 используй отдельный перенос.');
     preparedBackup=backup;
     $('backupPreview').textContent='По описанию копии: '+backup.snapshot.projects.length+' проектов, '+backup.snapshot.documents.length+' документов, '+backup.snapshot.revisions.length+' редакций, '+backup.manifest.length+' файлов. Полная проверка структуры, связей, размеров и SHA‑256 будет выполнена перед записью.';
+    restoreText('Файл прочитан. Готово к проверке и восстановлению.');
     notice('Копия выбрана. Проверь состав и нажми «Проверить и восстановить».');
-  } catch(error){event.target.value='';showError(error,'Не удалось прочитать копию');}
+  } catch(error){event.target.value='';showError(error,'Не удалось прочитать копию');restoreText($('message').textContent,'error');}
   finally{busy=false;controls();}
 });
-$('importBackup').addEventListener('click',()=>{
+$('importBackup').addEventListener('click',async()=>{
   if(!preparedBackup||busy||stale)return;
   if(!confirm('Заменить текущий архив выбранной полной копией? Сначала сохрани внешний экспорт. Предыдущее состояние останется одним локальным снимком восстановления.'))return;
   const backup=preparedBackup;
-  return run(expectedVersion=>store.importBackup({backup,expectedVersion}),'Полная копия восстановлена. Структура, связи, размеры и SHA‑256 всех вложений проверены.',()=>resetRevisionForm());
+  const success=await run(async expectedVersion=>{
+    startRestore('Начинаем проверку структуры, размеров и SHA‑256 вложений…');
+    await new Promise(resolve=>setTimeout(resolve,0));
+    return store.importBackup({backup,expectedVersion,onProgress:restoreStage});
+  },'Полная копия восстановлена. Структура, связи, размеры и SHA‑256 всех вложений проверены.',()=>resetRevisionForm());
+  finishRestore(success);
 });
-$('restorePrevious').addEventListener('click',()=>{
+$('restorePrevious').addEventListener('click',async()=>{
   if(!previous?.available||busy||stale)return;
   if(!confirm('Вернуть предыдущее состояние архива? Текущий каталог и вложения будут заменены. Текущее состояние станет новым снимком восстановления.'))return;
-  return run(expectedVersion=>store.restorePrevious({expectedVersion}),'Предыдущее состояние восстановлено, контрольные суммы вложений проверены.',()=>resetRevisionForm());
+  const success=await run(async expectedVersion=>{
+    startRestore('Проверяем предыдущий снимок и контрольные суммы вложений…');
+    await new Promise(resolve=>setTimeout(resolve,0));
+    return store.restorePrevious({expectedVersion,onProgress:restoreStage});
+  },'Предыдущее состояние восстановлено, контрольные суммы вложений проверены.',()=>resetRevisionForm());
+  finishRestore(success);
 });
 $('importLegacy').addEventListener('click',()=>{
   if(busy||stale)return;
@@ -228,7 +296,7 @@ $('legacyFile').addEventListener('change',async event=>{
   busy=true;controls();
   try {
     if(file.size>20*1024*1024)throw Error('Каталог R04 больше 20 МиБ.');
-    const raw=await file.text(),root=JSON.parse(raw),catalog=root.catalog===undefined?root:root.catalog;
+    const raw=await readText(file),root=JSON.parse(raw),catalog=root.catalog===undefined?root:root.catalog;
     if(!Array.isArray(catalog?.projects)||!Array.isArray(catalog?.docs)||!Array.isArray(catalog?.events))throw Error('В файле нет каталога R04: projects, docs, events.');
     preparedLegacy=raw;
     $('legacyPreview').textContent='По описанию файла: '+catalog.projects.length+' проектов, '+catalog.docs.length+' карточек документов, '+catalog.events.length+' событий. Полная проверка данных будет выполнена перед записью. Файлов-вложений в каталоге R04 нет.';
@@ -245,14 +313,21 @@ $('importLegacyFile').addEventListener('click',()=>{
 async function load(first=false) {
   if(busy)return;busy=true;controls();notice('Открываем локальный архив…');
   try {
-    snapshot=await(first?store.init():store.readSnapshot());stale=false;render();await refreshPrevious();document.body.dataset.ready='true';notice(first?'Архив открыт. Данные хранятся локально на этом устройстве.':'Каталог перечитан. Введённые поля сохранены.','success');
+    snapshot=await(first?store.init():store.readSnapshot());stale=false;uncertain=false;render();void refreshPrevious();document.body.dataset.ready='true';notice(first?'Архив открыт. Данные хранятся локально на этом устройстве.':'Каталог перечитан. Введённые поля сохранены.','success');
+    if(!$('restoreProgress').hidden)restoreText('Каталог перечитан. На экране показано фактическое сохранённое состояние.','success');
   } catch(error){showError(error,'Не удалось открыть архив');$('reloadRow').hidden=false;}
   finally{busy=false;controls();}
 }
 $('reloadCatalog').addEventListener('click',()=>load(!snapshot));
+$('reloadRestore').addEventListener('click',()=>load(!snapshot));
 window.addEventListener('focus',async()=>{
   if(busy||!snapshot||stale)return;
-  try {const current=await store.readSnapshot();if(current.version!==snapshot.version){stale=true;notice('Архив изменён в другой вкладке. Перечитай каталог перед продолжением. Введённые поля сохранены.','error');controls();}}
-  catch(error){showError(error,'Не удалось проверить актуальность каталога');}
+  const checkedVersion=snapshot.version;
+  try {
+    const current=await store.readSnapshot();
+    if(busy||!snapshot||snapshot.version!==checkedVersion)return;
+    if(current.version!==checkedVersion){stale=true;notice('Архив изменён в другой вкладке. Перечитай каталог перед продолжением. Введённые поля сохранены.','error');restoreText($('message').textContent,'error');controls();}
+  }
+  catch(error){if(!busy&&snapshot?.version===checkedVersion)showError(error,'Не удалось проверить актуальность каталога');}
 });
 load(true);
