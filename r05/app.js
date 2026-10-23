@@ -1,9 +1,11 @@
-import * as store from './store.js?v=0.7.0';
-import { buildFilePlan } from './batch.js?v=0.7.0';
+import * as store from './store.js?v=0.8.0';
+import { buildFilePlan } from './batch.js?v=0.8.0';
+import { createMultipart } from './multipart.js?v=0.8.0';
+const multipart=createMultipart(store);
 
 const $ = id => document.getElementById(id);
 const esc = value => String(value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const bytes = n => n < 1024 ? n+' Б' : n < 1048576 ? (n/1024).toFixed(1)+' КиБ' : (n/1048576).toFixed(1)+' МиБ';
+const bytes = n => n < 1024 ? n+' Б' : n < 1048576 ? (n/1024).toFixed(1)+' КиБ' : n < 1073741824 ? (n/1048576).toFixed(1)+' МиБ' : (n/1073741824).toFixed(2)+' ГиБ';
 const date = value => new Date(value).toLocaleString('ru-RU', {day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit'});
 const stamp = () => new Date().toISOString().replace(/[:.]/g,'-');
 let snapshot = null, busy = false, stale = false, uncertain = false, reloadSuggested = false, activeDocument = null, pendingAttachment = null, preparedBackup = null, preparedLegacy = null, previous = null;
@@ -12,6 +14,7 @@ let renameTarget=null, renameFocus=null, preparedCatalog=null;
 const PAGE_SIZE=40;
 let documentPage=1, index={projectNames:new Map(),documentsByProject:new Map(),revisionsByDocument:new Map()};
 let batchRows=[],batchRunning=false,batchController=null,batchCancelRequested=false,batchTargetRow=null,batchTargetPage=1,storageInfoRequest=0;
+let multipartPlan=null,multipartManifestRequested=false,multipartPartRequests=new Set(),multipartPage=0,multipartSelectedFiles=[],multipartSelection=null,multipartRunning=false,multipartController=null,multipartCancelRequested=false;
 const extensionMap={PDF:['pdf'],STEP:['step','stp'],DWG:['dwg'],DXF:['dxf'],SLDPRT:['sldprt'],XLSX:['xlsx']};
 
 function restoreText(text,kind='') {
@@ -23,7 +26,7 @@ function updateRestoreDock() {
   if(!restoreOperation)return;
   const seconds=Math.floor((Date.now()-restoreOperation.started)/1000);
   const text=restoreOperation.text+(seconds?'\nПрошло '+seconds+' с.':'');
-  if(restoreOperation.kind==='batch')batchText(text);else restoreText(text);
+  if(restoreOperation.kind==='batch')batchText(text);else if(restoreOperation.kind==='multipart')multipartText(text);else if(restoreOperation.kind==='migration'){$('migrationProgress').hidden=false;$('migrationProgress').textContent=text;}else restoreText(text);
   $('operationDock').textContent=text;
 }
 function startRestore(text,kind='restore') {
@@ -45,7 +48,7 @@ function finishRestore(success) {
   const kind=restoreOperation?.kind;
   if(restoreOperation)clearInterval(restoreOperation.timer);
   restoreOperation=null;$('operationDock').hidden=true;
-  if(kind==='batch')batchText($('message').textContent,success?'success':'error');else restoreText($('message').textContent,success?'success':'error');
+  if(kind==='batch')batchText($('message').textContent,success?'success':'error');else if(kind==='multipart')multipartText($('message').textContent,success?'success':'error');else if(kind==='migration'){$('migrationProgress').hidden=false;$('migrationProgress').textContent=$('message').textContent;$('migrationProgress').className='restore-progress '+(success?'success':'error');}else restoreText($('message').textContent,success?'success':'error');
 }
 function readText(file) {
   return new Promise((resolve,reject)=>{
@@ -106,14 +109,27 @@ function controls() {
   $('cancelBatch').textContent=batchCancelRequested?'Останавливаем…':'Отменить пакет';
   for(const button of $('batchPreview').querySelectorAll('button'))button.disabled=disabled;
   for(const button of $('batchTargetList').querySelectorAll('button'))button.disabled=disabled||button.dataset.unavailable==='true';
+  $('prepareMultipart').disabled=disabled;
+  $('downloadMultipartManifest').disabled=disabled||!multipartPlan;
+  $('releaseMultipartExport').disabled=busy||!multipartPlan;
+  $('multipartFiles').disabled=disabled;
+  $('inspectMultipart').disabled=disabled||!multipartSelectedFiles.length;
+  $('restoreMultipart').disabled=disabled||!multipartSelection;
+  for(const button of $('multipartParts').querySelectorAll('button'))button.disabled=disabled;
+  $('multipartPartPrev').disabled=busy||!multipartPlan||multipartPage===0;
+  $('multipartPartNext').disabled=busy||!multipartPlan||(multipartPage+1)*PAGE_SIZE>=multipartPlan.partCount;
+  $('multipartCancelRow').hidden=!multipartRunning;
+  $('cancelMultipart').disabled=!multipartRunning||multipartCancelRequested;
+  $('cancelMultipart').textContent=multipartCancelRequested?'Останавливаем…':'Отменить операцию с комплектом';
   document.body.setAttribute('aria-busy',String(busy));
 }
 function showError(error, prefix='Операция не выполнена') {
   if(error?.code==='STALE') stale=true;
   if(error?.code==='UNCERTAIN'){stale=true;uncertain=true;}
   let detail=error?.message||String(error);
-  if(/blob.*(?:prepar|serializ)|(?:prepar|serializ).*blob/i.test(detail)) {reloadSuggested=true;detail='Safari не смог подготовить вложение к сохранению прежним способом. Проверь, что в шапке указана R07, закрой прежнюю вкладку и открой приложение заново. Затем повторно выбери тот же файл резервной копии. Не очищай данные Safari.';}
-  else if(error?.name==='DataCloneError') {reloadSuggested=true;detail='Браузер не смог подготовить данные для локального сохранения. Проверь версию R07 в шапке и открой приложение заново. Файл резервной копии можно выбрать повторно; не очищай данные браузера.';}
+  if(error?.code==='MIGRATION_BLOCKED') {reloadSuggested=true;detail='Для обновления хранилища закрой другие вкладки и прежний запуск приложения с домашнего экрана, затем нажми «Перечитать каталог». Данные браузера не очищай.';}
+  else if(/blob.*(?:prepar|serializ)|(?:prepar|serializ).*blob/i.test(detail)) {reloadSuggested=true;detail='Safari не смог подготовить вложение к сохранению прежним способом. Проверь, что в шапке указана R08, закрой прежнюю вкладку и открой приложение заново. Затем повторно выбери тот же файл резервной копии. Не очищай данные Safari.';}
+  else if(error?.name==='DataCloneError') {reloadSuggested=true;detail='Браузер не смог подготовить данные для локального сохранения. Проверь версию R08 в шапке и открой приложение заново. Файл резервной копии можно выбрать повторно; не очищай данные браузера.';}
   else if(error?.name==='QuotaExceededError') detail='На устройстве недостаточно доступного места. Данные операции не сохранены. Освободи место и попробуй ещё раз.';
   else if(error?.name==='SecurityError') detail='Браузер запретил доступ к локальному хранилищу. Проверь настройки Safari.';
   else if(error?.name==='UnknownError'||error?.name==='InvalidStateError') {reloadSuggested=true;detail='Браузер не смог выполнить операцию с локальным хранилищем. Закрой другие вкладки приложения и перечитай каталог перед повторной попыткой. Исходный файл резервной копии не изменялся. Не очищай данные браузера.';}
@@ -232,6 +248,59 @@ async function refreshStorageEstimate() {
   const estimateText=Number.isFinite(usage)&&usage>=0&&Number.isFinite(quota)&&quota>=0?'Оценка браузера для всего сайта: занято '+bytes(usage)+', лимит '+bytes(quota)+'.':'Оценка занятого места и лимита браузера недоступна.';
   $('storageEstimate').textContent=estimateText+' Постоянное хранилище: '+(persisted===true?'подтверждено браузером.':persisted===false?'не подтверждено браузером.':'неизвестно.');
 }
+function multipartText(text,kind='') {
+  $('multipartProgress').hidden=false;$('multipartProgress').textContent=text;$('multipartProgress').className='restore-progress'+(kind?' '+kind:'');
+}
+function multipartStage(progress) {
+  if(!restoreOperation||restoreOperation.kind!=='multipart')return;
+  const names={export:'Подготавливаем комплект резервной копии…',check:'Проверяем состав комплекта…',read:'Читаем часть комплекта…',hash:'Проверяем контрольные суммы…',write:'Все части проверены. Сохраняем архив и предыдущий снимок…'};
+  const count=Number.isFinite(progress?.total)&&progress.total>0?' ('+progress.completed+' из '+progress.total+')':'';
+  restoreOperation.text=(multipartCancelRequested?'Отмена запрошена. Ожидаем безопасного завершения.\n':'')+(names[progress?.stage]||'Обрабатываем комплект…')+count;
+  updateRestoreDock();
+}
+function releaseMultipartPlan() {
+  const plan=multipartPlan;multipartPlan=null;multipartManifestRequested=false;multipartPartRequests.clear();multipartPage=0;
+  if(plan)Promise.resolve().then(()=>multipart.releaseExport({plan})).catch(()=>{});
+}
+function renderMultipartExport() {
+  if(multipartPlan&&snapshot&&multipartPlan.manifest.snapshot.version!==snapshot.version)releaseMultipartPlan();
+  $('multipartExportFiles').hidden=!multipartPlan;
+  if(!multipartPlan){$('multipartExportSummary').textContent='Подготовь новый комплект для текущего состояния архива.';$('multipartParts').innerHTML='';return;}
+  const plan=multipartPlan,requested=multipartPartRequests.size+(multipartManifestRequested?1:0),files=plan.partCount+1;
+  $('multipartExportSummary').textContent='Состояние архива №'+plan.manifest.snapshot.version+'; подготовлено '+date(plan.manifest.createdAt)+'. Данные вложений: '+bytes(plan.totalBytes)+'. Комплект: каталог и '+plan.partCount+' частей; всего файлов '+files+'. Скачивание запрошено для '+requested+' из '+files+'.'+(requested===files?' Все кнопки скачивания использованы — проверь фактическое наличие всех файлов в «Файлах».':' Скачай все файлы комплекта в одну папку.');
+  $('multipartManifestState').textContent=plan.manifestName+' · '+(multipartManifestRequested?'Скачивание запрошено — проверь файл на устройстве.':'Ещё не запрашивали скачивание.');
+  const start=multipartPage*PAGE_SIZE,parts=plan.manifest.parts.slice(start,start+PAGE_SIZE);
+  $('multipartParts').innerHTML=parts.map((part,offset)=>{const partIndex=start+offset,requested=multipartPartRequests.has(partIndex);return `<div class="multipart-part${requested?' requested':''}"><strong>Часть ${partIndex+1} из ${plan.partCount}</strong><p>${esc(part.fileName)} · ${bytes(part.size)}</p><span>${requested?'Скачивание запрошено; проверь наличие файла.':'Нужно скачать.'}</span><div class="actions"><button class="small ghost" data-multipart-part="${partIndex}">${requested?'Скачать повторно':'Скачать часть '+(partIndex+1)}</button></div></div>`;}).join('');
+  $('multipartPartPage').textContent=plan.partCount?'Части '+(start+1)+'–'+(start+parts.length)+' из '+plan.partCount:'Вложений нет: достаточно файла каталога.';
+}
+async function multipartRead(action,start,success,after) {
+  if(busy||!snapshot||stale)return false;
+  busy=true;multipartRunning=true;multipartCancelRequested=false;multipartController=new AbortController();controls();startRestore(start,'multipart');
+  let ok=false;
+  try{
+    await new Promise(resolve=>setTimeout(resolve,0));
+    const result=await action(multipartController.signal);
+    if(after)after(result);
+    notice(typeof success==='function'?success(result):success,'success');ok=true;renderMultipartExport();return true;
+  }catch(error){showError(error,'Операция с комплектом не выполнена');return false;}
+  finally{finishRestore(ok);busy=false;multipartRunning=false;multipartController=null;multipartCancelRequested=false;controls();}
+}
+function multipartSelectionText(selection) {
+  const manifest=selection.manifest,catalog=manifest.snapshot;
+  return `Комплект выбран: проектов ${catalog.projects.length}, документов ${catalog.documents.length}, редакций ${catalog.revisions.length}, частей ${manifest.parts.length}. Комплектность и заголовки проверены. Содержимое всех частей, размеры и SHA‑256 будут проверены перед заменой архива.`;
+}
+async function inspectMultipartFiles() {
+  if(!multipartSelectedFiles.length||busy||stale)return;
+  multipartSelection=null;$('multipartImportPreview').textContent='Проверяем '+multipartSelectedFiles.length+' выбранных файлов…';
+  await multipartRead(signal=>multipart.inspectFiles({files:multipartSelectedFiles,onProgress:multipartStage,signal}),'Проверяем каталог и состав частей…','Комплектность проверена. Проверь состав и нажми «Проверить и восстановить».',selection=>{multipartSelection=selection;$('multipartImportPreview').textContent=multipartSelectionText(selection);});
+  if(!multipartSelection)$('multipartImportPreview').textContent='Комплект не принят: '+$('message').textContent+' Выбранные файлы остаются в списке; можно повторить проверку или выбрать комплект заново.';
+}
+function migrationStage(progress) {
+  if(!restoreOperation||restoreOperation.kind!=='migration')return;
+  const names={migration:'Обновляем хранилище, сохраняя имеющийся архив…',read:'Проверяем прежние данные…',write:'Переносим файлы в новое хранилище…'};
+  const count=Number.isFinite(progress?.total)&&progress.total>0?' ('+progress.completed+' из '+progress.total+')':'';
+  restoreOperation.text=(names[progress?.stage]||'Открываем и проверяем хранилище…')+count;updateRestoreDock();
+}
 function rebuildIndex() {
   index={projectNames:new Map(snapshot.projects.map(project=>[project.id,project.name])),documentsByProject:new Map(),revisionsByDocument:new Map(),documentsById:new Map(snapshot.documents.map(doc=>[doc.id,doc])),revisionsById:new Map(snapshot.revisions.map(revision=>[revision.id,revision]))};
   for(const doc of snapshot.documents){if(!index.documentsByProject.has(doc.projectId))index.documentsByProject.set(doc.projectId,[]);index.documentsByProject.get(doc.projectId).push(doc);}
@@ -300,7 +369,7 @@ function render() {
   renderDocuments();
   $('backupStats').innerHTML=`<div><strong>${snapshot.projects.length}</strong><span>проектов</span></div><div><strong>${snapshot.revisions.length}</strong><span>редакций</span></div><div><strong>${attachmentCount()}</strong><span>сохранённых файлов · ${bytes(attachmentSize())}</span></div><div><strong>${snapshot.revisions.filter(r=>r.source).length}</strong><span>карточек исходников</span></div>`;
   $('eventList').innerHTML=snapshot.events?.length?snapshot.events.map(event=>`<div class="revision"><div style="overflow-wrap:anywhere">${esc(event.text)}</div><div class="muted" style="font-size:11px;margin-top:4px">${esc(/^\d{4}-\d{2}-\d{2}T/.test(event.date)?date(event.date):event.date)}</div></div>`).join(''):'<div class="empty"><strong>Журнал пока пуст</strong><p>Здесь появятся события работы с архивом.</p></div>';
-  renderBatch();renderStorageInfo();
+  renderBatch();renderStorageInfo();renderMultipartExport();
   controls();
 }
 function renderDocuments() {
@@ -352,6 +421,61 @@ function download(blob,name) {
   link.href=url;link.download=name;document.body.append(link);link.click();link.remove();
   setTimeout(()=>URL.revokeObjectURL(url),30000);
 }
+$('prepareMultipart').addEventListener('click',async()=>{
+  if(busy||stale||!snapshot)return;
+  if(multipartPlan&&!confirm('Подготовить новый комплект для текущего архива? Отметки скачивания прежнего комплекта будут сброшены. Части разных комплектов нельзя смешивать.'))return;
+  const expectedVersion=snapshot.version;
+  await multipartRead(async signal=>{
+    const old=multipartPlan;multipartPlan=null;multipartManifestRequested=false;multipartPartRequests.clear();multipartPage=0;renderMultipartExport();
+    if(old)await multipart.releaseExport({plan:old});
+    return multipart.prepareExport({expectedVersion,onProgress:multipartStage,signal});
+  },'Подготавливаем комплект. Вложения обрабатываются по частям…','Комплект подготовлен. Теперь скачай каталог и каждую часть отдельной кнопкой.',plan=>{multipartPlan=plan;multipartManifestRequested=false;multipartPartRequests.clear();multipartPage=0;});
+});
+$('downloadMultipartManifest').addEventListener('click',async()=>{
+  if(!multipartPlan||busy||stale)return;const plan=multipartPlan;
+  await multipartRead(()=>multipart.manifestFile({plan}),'Подготавливаем файл каталога комплекта…','Скачивание каталога запрошено. Проверь, что файл сохранился в «Файлы».',result=>{download(result.blob,result.fileName);multipartManifestRequested=true;});
+});
+$('multipartParts').addEventListener('click',async event=>{
+  if(!multipartPlan||busy||stale)return;
+  const button=event.target.closest('[data-multipart-part]');if(!button)return;
+  const index=Number(button.dataset.multipartPart),plan=multipartPlan;
+  if(!Number.isInteger(index)||index<0||index>=plan.partCount)return;
+  await multipartRead(signal=>multipart.exportPart({plan,index,signal}),'Читаем часть '+(index+1)+' из '+plan.partCount+'…','Скачивание части '+(index+1)+' запрошено. Проверь её наличие в «Файлах».',result=>{download(result.blob,result.fileName);multipartPartRequests.add(index);});
+});
+$('multipartPartPrev').addEventListener('click',()=>{if(busy||multipartPage===0)return;multipartPage--;renderMultipartExport();controls();});
+$('multipartPartNext').addEventListener('click',()=>{if(busy||!multipartPlan||(multipartPage+1)*PAGE_SIZE>=multipartPlan.partCount)return;multipartPage++;renderMultipartExport();controls();});
+$('releaseMultipartExport').addEventListener('click',async()=>{
+  if(busy||!multipartPlan)return;
+  const plan=multipartPlan;
+  await multipartRead(()=>multipart.releaseExport({plan}),'Закрываем подготовленный комплект…','Комплект закрыт. Уже скачанные файлы на устройстве не изменялись.',()=>{multipartPlan=null;multipartManifestRequested=false;multipartPartRequests.clear();multipartPage=0;});
+});
+$('multipartFiles').addEventListener('change',async event=>{
+  if(busy||stale)return;
+  multipartSelectedFiles=Array.from(event.target.files||[]);multipartSelection=null;
+  if(!multipartSelectedFiles.length){$('multipartImportPreview').textContent='Выбери каталог и все части одного комплекта.';controls();return;}
+  await inspectMultipartFiles();
+});
+$('inspectMultipart').addEventListener('click',inspectMultipartFiles);
+$('restoreMultipart').addEventListener('click',async()=>{
+  if(busy||stale||!snapshot||!multipartSelection)return;
+  const selection=multipartSelection;
+  if(!confirm('Заменить текущий архив выбранным комплектом?\n'+multipartSelectionText(selection)+'\nТекущее состояние с файлами сохранится как один предыдущий снимок, заменив прежний. Восстановление снимка тоже заменяет ВЕСЬ архив и более поздние изменения. Следующее удаление, импорт, пакетная загрузка или восстановление заменит снимок снова.'))return;
+  multipartRunning=true;multipartCancelRequested=false;multipartController=new AbortController();
+  try{
+    const success=await run(async expectedVersion=>{
+      startRestore('Проверяем содержимое всех частей перед заменой архива…','multipart');
+      await new Promise(resolve=>setTimeout(resolve,0));
+      return multipart.restore({selection,expectedVersion,onProgress:multipartStage,signal:multipartController.signal});
+    },'Комплект восстановлен целиком. Структура, части, размеры и SHA‑256 проверены. Предыдущий архив доступен в разделе «Копия».',()=>{resetRevisionForm();multipartSelection=null;multipartSelectedFiles=[];$('multipartFiles').value='';$('multipartImportPreview').textContent='Комплект восстановлен. Выбранные файлы на устройстве не изменялись.';});
+    finishRestore(success);
+  }finally{multipartRunning=false;multipartController=null;multipartCancelRequested=false;controls();}
+});
+$('cancelMultipart').addEventListener('click',()=>{
+  if(!multipartRunning||!multipartController||multipartCancelRequested)return;
+  multipartCancelRequested=true;multipartController.abort();
+  if(restoreOperation?.kind==='multipart'){restoreOperation.text='Отмена запрошена. Ожидаем безопасного завершения текущей операции…';updateRestoreDock();}
+  controls();
+});
 $('batchFiles').addEventListener('change',event=>{
   if(busy||stale||!snapshot)return;
   const files=Array.from(event.target.files||[]);if(!files.length)return;
@@ -524,7 +648,7 @@ $('exportBackup').addEventListener('click',async()=>{
   if(busy||!snapshot||stale)return;busy=true;controls();notice('Проверяем вложения и готовим полную копию…');
   try {
     const backup=await store.exportBackup();
-    download(new Blob([JSON.stringify(backup)],{type:'application/json'}),'IGNIS_PRO_R07_full_'+stamp()+'.json');
+    download(new Blob([JSON.stringify(backup)],{type:'application/json'}),'IGNIS_PRO_R08_full_'+stamp()+'.json');
     notice('Полная копия подготовлена: '+backup.snapshot.projects.length+' проектов, '+backup.snapshot.revisions.length+' редакций, '+backup.manifest.length+' файлов. Размеры и SHA‑256 вложений проверены. Сохрани файл вне приложения.','success');
   } catch(error){showError(error,'Не удалось подготовить копию');}
   finally{busy=false;controls();}
@@ -538,7 +662,7 @@ $('backupFile').addEventListener('change',async event=>{
     if(file.size>maxBackup)throw Error('Файл копии больше '+bytes(maxBackup));
     const text=await readText(file);
     const backup=JSON.parse(text);
-    if(backup.app!=='RRR'||backup.kind!=='full'||![1,2].includes(backup.schemaVersion)||!Array.isArray(backup.snapshot?.projects)||!Array.isArray(backup.snapshot?.documents)||!Array.isArray(backup.snapshot?.revisions)||!Array.isArray(backup.manifest))throw Error('Это не полная резервная копия архива. Для каталога R04 используй отдельный перенос.');
+    if(backup.app!=='RRR'||backup.kind!=='full'||![1,2,3].includes(backup.schemaVersion)||!Array.isArray(backup.snapshot?.projects)||!Array.isArray(backup.snapshot?.documents)||!Array.isArray(backup.snapshot?.revisions)||!Array.isArray(backup.manifest))throw Error('Это не полная резервная копия архива. Для каталога R04 используй отдельный перенос.');
     preparedBackup=backup;
     $('backupPreview').textContent='По описанию копии: '+backup.snapshot.projects.length+' проектов, '+backup.snapshot.documents.length+' документов, '+backup.snapshot.revisions.length+' редакций, '+backup.manifest.length+' файлов. Полная проверка структуры, связей, размеров и SHA‑256 будет выполнена перед записью.';
     restoreText('Файл прочитан. Готово к проверке и восстановлению.');
@@ -569,7 +693,7 @@ $('restorePrevious').addEventListener('click',async()=>{
 });
 $('importLegacy').addEventListener('click',()=>{
   if(busy||stale)return;
-  if(!confirm('Перенести проекты, карточки документов и журнал R04 в пустой архив R07? Прежний каталог R04 останется без изменений. Оригиналов файлов в нём нет.'))return;
+  if(!confirm('Перенести проекты, карточки документов и журнал R04 в пустой архив R08? Прежний каталог R04 останется без изменений. Оригиналов файлов в нём нет.'))return;
   return run(expectedVersion=>store.importLegacy({expectedVersion}),'Каталог R04 перенесён. Прежние данные не изменены. Прикрепи оригиналы файлов к нужным редакциям.');
 });
 $('legacyFile').addEventListener('change',async event=>{
@@ -588,16 +712,18 @@ $('legacyFile').addEventListener('change',async event=>{
 });
 $('importLegacyFile').addEventListener('click',()=>{
   if(!preparedLegacy||busy||stale)return;
-  if(!confirm('Перенести выбранный каталог R04 в пустой архив R07? Будут перенесены проекты, карточки документов и журнал. Исходный файл и прежний каталог не изменятся.'))return;
+  if(!confirm('Перенести выбранный каталог R04 в пустой архив R08? Будут перенесены проекты, карточки документов и журнал. Исходный файл и прежний каталог не изменятся.'))return;
   const raw=preparedLegacy;
   return run(expectedVersion=>store.importLegacy({expectedVersion,raw}),'Каталог из файла R04 перенесён. Прикрепи оригиналы файлов к нужным редакциям.');
 });
 async function load(first=false) {
   if(busy)return;busy=true;controls();notice('Открываем локальный архив…');
+  if(first)startRestore('Открываем и проверяем хранилище. При обновлении имеющиеся данные сохраняются…','migration');
   try {
-    snapshot=await(first?store.init():store.readSnapshot());stale=false;uncertain=false;reloadSuggested=false;render();void refreshPrevious();void refreshStorageEstimate();document.body.dataset.ready='true';notice(first?'Архив открыт. Данные хранятся локально на этом устройстве.':'Каталог перечитан. Введённые поля сохранены. Выбранные файлы пакета сохранены в списке; назначения проверены по текущим редакциям.','success');
+    snapshot=await(first?store.init({onProgress:migrationStage}):store.readSnapshot());stale=false;uncertain=false;reloadSuggested=false;render();void refreshPrevious();void refreshStorageEstimate();document.body.dataset.ready='true';notice(first?'Архив открыт. Данные хранятся локально на этом устройстве.':'Каталог перечитан. Введённые поля сохранены.'+(batchRows.length?' Выбранные файлы пакета сохранены в списке; назначения проверены по текущим редакциям.':''),'success');
     if(!$('restoreProgress').hidden)restoreText('Каталог перечитан. На экране показано фактическое сохранённое состояние.','success');
-  } catch(error){showError(error,'Не удалось открыть архив');$('reloadRow').hidden=false;}
+    if(first)finishRestore(true);
+  } catch(error){showError(error,'Не удалось открыть архив');$('reloadRow').hidden=false;if(first)finishRestore(false);}
   finally{busy=false;controls();}
 }
 $('reloadCatalog').addEventListener('click',()=>load(!snapshot));
