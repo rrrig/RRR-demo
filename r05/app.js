@@ -1,11 +1,11 @@
-import * as store from './store.js?v=0.5.1';
+import * as store from './store.js?v=0.5.2';
 
 const $ = id => document.getElementById(id);
 const esc = value => String(value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const bytes = n => n < 1024 ? n+' Б' : n < 1048576 ? (n/1024).toFixed(1)+' КиБ' : (n/1048576).toFixed(1)+' МиБ';
 const date = value => new Date(value).toLocaleString('ru-RU', {day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit'});
 const stamp = () => new Date().toISOString().replace(/[:.]/g,'-');
-let snapshot = null, busy = false, stale = false, uncertain = false, activeDocument = null, pendingAttachment = null, preparedBackup = null, preparedLegacy = null, previous = null;
+let snapshot = null, busy = false, stale = false, uncertain = false, reloadSuggested = false, activeDocument = null, pendingAttachment = null, preparedBackup = null, preparedLegacy = null, previous = null;
 let previousRequest=0, restoreOperation=null;
 
 function restoreText(text,kind='') {
@@ -73,8 +73,8 @@ function controls() {
   $('backupFile').disabled=busy||!snapshot||stale;
   $('reloadCatalog').disabled=busy;
   $('reloadRestore').disabled=busy;
-  $('reloadRow').hidden=(!stale&&!!snapshot);
-  $('restoreReloadRow').hidden=!stale;
+  $('reloadRow').hidden=(!stale&&!reloadSuggested&&!!snapshot);
+  $('restoreReloadRow').hidden=!stale&&!reloadSuggested;
   $('reloadHint').textContent=uncertain?'Результат записи ещё не подтверждён. Перечитай фактическое состояние перед новой операцией.':'Введённые поля останутся на экране.';
   for (const element of $('documentList').querySelectorAll('button,select')) element.disabled=disabled;
   $('docProject').disabled=busy||!!activeDocument;
@@ -90,11 +90,14 @@ function showError(error, prefix='Операция не выполнена') {
   if(error?.code==='STALE') stale=true;
   if(error?.code==='UNCERTAIN'){stale=true;uncertain=true;}
   let detail=error?.message||String(error);
-  if(error?.name==='QuotaExceededError') detail='На устройстве недостаточно доступного места. Данные операции не сохранены. Освободи место и попробуй ещё раз.';
+  if(/blob.*(?:prepar|serializ)|(?:prepar|serializ).*blob/i.test(detail)) {reloadSuggested=true;detail='Safari не смог подготовить вложение к сохранению прежним способом. Проверь, что в шапке указана R05.2, закрой прежнюю вкладку и открой приложение заново. Затем повторно выбери тот же файл резервной копии. Не очищай данные Safari.';}
+  else if(error?.name==='DataCloneError') {reloadSuggested=true;detail='Браузер не смог подготовить данные для локального сохранения. Проверь версию R05.2 в шапке и открой приложение заново. Файл резервной копии можно выбрать повторно; не очищай данные браузера.';}
+  else if(error?.name==='QuotaExceededError') detail='На устройстве недостаточно доступного места. Данные операции не сохранены. Освободи место и попробуй ещё раз.';
   else if(error?.name==='SecurityError') detail='Браузер запретил доступ к локальному хранилищу. Проверь настройки Safari.';
+  else if(error?.name==='UnknownError'||error?.name==='InvalidStateError') {reloadSuggested=true;detail='Браузер не смог выполнить операцию с локальным хранилищем. Закрой другие вкладки приложения и перечитай каталог перед повторной попыткой. Исходный файл резервной копии не изменялся. Не очищай данные браузера.';}
   if(uncertain)detail+=' Результат записи не подтверждён. Новые изменения заблокированы: нажми «Перечитать каталог», чтобы увидеть фактическое состояние.';
   notice(prefix+': '+detail,'error');
-  if(stale)restoreText($('message').textContent,'error');
+  if(stale||reloadSuggested)restoreText($('message').textContent,'error');
   controls();
 }
 async function refreshPrevious() {
@@ -171,6 +174,7 @@ async function run(action, success, after) {
   busy=true;controls();
   try {
     snapshot=await action(snapshot.version);
+    reloadSuggested=false;
     if(after)after();
     preparedBackup=null;$('backupFile').value='';$('backupPreview').textContent='';
     preparedLegacy=null;$('legacyFile').value='';$('legacyPreview').textContent='';
@@ -313,7 +317,7 @@ $('importLegacyFile').addEventListener('click',()=>{
 async function load(first=false) {
   if(busy)return;busy=true;controls();notice('Открываем локальный архив…');
   try {
-    snapshot=await(first?store.init():store.readSnapshot());stale=false;uncertain=false;render();void refreshPrevious();document.body.dataset.ready='true';notice(first?'Архив открыт. Данные хранятся локально на этом устройстве.':'Каталог перечитан. Введённые поля сохранены.','success');
+    snapshot=await(first?store.init():store.readSnapshot());stale=false;uncertain=false;reloadSuggested=false;render();void refreshPrevious();document.body.dataset.ready='true';notice(first?'Архив открыт. Данные хранятся локально на этом устройстве.':'Каталог перечитан. Введённые поля сохранены.','success');
     if(!$('restoreProgress').hidden)restoreText('Каталог перечитан. На экране показано фактическое сохранённое состояние.','success');
   } catch(error){showError(error,'Не удалось открыть архив');$('reloadRow').hidden=false;}
   finally{busy=false;controls();}
