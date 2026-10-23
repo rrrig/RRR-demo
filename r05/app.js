@@ -1,4 +1,4 @@
-import * as store from './store.js?v=0.5.2';
+import * as store from './store.js?v=0.6.0';
 
 const $ = id => document.getElementById(id);
 const esc = value => String(value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -7,6 +7,9 @@ const date = value => new Date(value).toLocaleString('ru-RU', {day:'2-digit',mon
 const stamp = () => new Date().toISOString().replace(/[:.]/g,'-');
 let snapshot = null, busy = false, stale = false, uncertain = false, reloadSuggested = false, activeDocument = null, pendingAttachment = null, preparedBackup = null, preparedLegacy = null, previous = null;
 let previousRequest=0, restoreOperation=null;
+let renameTarget=null, renameFocus=null, preparedCatalog=null;
+const PAGE_SIZE=40;
+let documentPage=1, index={projectNames:new Map(),documentsByProject:new Map(),revisionsByDocument:new Map()};
 
 function restoreText(text,kind='') {
   $('restoreProgress').hidden=false;
@@ -84,14 +87,21 @@ function controls() {
   $('docRevision').disabled=busy;
   $('attachmentFile').disabled=busy;
   $('cancelRevision').disabled=busy;
+  $('catalogFile').disabled=disabled;
+  $('mergeCatalog').disabled=disabled||!preparedCatalog;
+  $('renameName').disabled=busy;
+  $('saveRename').disabled=disabled;
+  $('cancelRename').disabled=busy;
+  for(const button of $('projectList').querySelectorAll('button'))button.disabled=disabled;
+  $('showMoreDocuments').disabled=busy;
   document.body.setAttribute('aria-busy',String(busy));
 }
 function showError(error, prefix='Операция не выполнена') {
   if(error?.code==='STALE') stale=true;
   if(error?.code==='UNCERTAIN'){stale=true;uncertain=true;}
   let detail=error?.message||String(error);
-  if(/blob.*(?:prepar|serializ)|(?:prepar|serializ).*blob/i.test(detail)) {reloadSuggested=true;detail='Safari не смог подготовить вложение к сохранению прежним способом. Проверь, что в шапке указана R05.2, закрой прежнюю вкладку и открой приложение заново. Затем повторно выбери тот же файл резервной копии. Не очищай данные Safari.';}
-  else if(error?.name==='DataCloneError') {reloadSuggested=true;detail='Браузер не смог подготовить данные для локального сохранения. Проверь версию R05.2 в шапке и открой приложение заново. Файл резервной копии можно выбрать повторно; не очищай данные браузера.';}
+  if(/blob.*(?:prepar|serializ)|(?:prepar|serializ).*blob/i.test(detail)) {reloadSuggested=true;detail='Safari не смог подготовить вложение к сохранению прежним способом. Проверь, что в шапке указана R06, закрой прежнюю вкладку и открой приложение заново. Затем повторно выбери тот же файл резервной копии. Не очищай данные Safari.';}
+  else if(error?.name==='DataCloneError') {reloadSuggested=true;detail='Браузер не смог подготовить данные для локального сохранения. Проверь версию R06 в шапке и открой приложение заново. Файл резервной копии можно выбрать повторно; не очищай данные браузера.';}
   else if(error?.name==='QuotaExceededError') detail='На устройстве недостаточно доступного места. Данные операции не сохранены. Освободи место и попробуй ещё раз.';
   else if(error?.name==='SecurityError') detail='Браузер запретил доступ к локальному хранилищу. Проверь настройки Safari.';
   else if(error?.name==='UnknownError'||error?.name==='InvalidStateError') {reloadSuggested=true;detail='Браузер не смог выполнить операцию с локальным хранилищем. Закрой другие вкладки приложения и перечитай каталог перед повторной попыткой. Исходный файл резервной копии не изменялся. Не очищай данные браузера.';}
@@ -107,7 +117,7 @@ async function refreshPrevious() {
     const result=await store.getPreviousInfo();
     if(request!==previousRequest)return;
     previous=result;
-    $('previousInfo').textContent=previous.available ? `${previous.projects} проектов · ${previous.documents} документов · ${previous.revisions} редакций. Восстановление заменит текущий архив.` : 'Снимка пока нет. Он появится перед первым восстановлением или переносом R04.';
+    $('previousInfo').textContent=previous.available ? `${previous.projects} проектов · ${previous.documents} документов · ${previous.revisions} редакций. Восстановление заменит текущий архив.` : 'Снимка пока нет. Он появится перед первым восстановлением, переносом R04 или добавлением новых записей из каталога.';
   } catch(error) {
     if(request!==previousRequest)return;
     previous=null;
@@ -123,15 +133,46 @@ function fillProjects(id, all=false) {
 }
 function attachmentCount(){return snapshot.revisions.filter(r=>r.attachment).length;}
 function attachmentSize(){return snapshot.revisions.reduce((sum,r)=>sum+(r.attachment?.size||0),0);}
+function rebuildIndex() {
+  index={projectNames:new Map(snapshot.projects.map(project=>[project.id,project.name])),documentsByProject:new Map(),revisionsByDocument:new Map()};
+  for(const doc of snapshot.documents){if(!index.documentsByProject.has(doc.projectId))index.documentsByProject.set(doc.projectId,[]);index.documentsByProject.get(doc.projectId).push(doc);}
+  for(const revision of snapshot.revisions){if(!index.revisionsByDocument.has(revision.documentId))index.revisionsByDocument.set(revision.documentId,[]);index.revisionsByDocument.get(revision.documentId).push(revision);}
+}
+function sourceMarkup(revision) {
+  const source=revision.source;
+  if(source?.kind!=='chatgpt-library'||!/^libfile_[a-zA-Z0-9]+$/.test(source.libraryFileId))return '';
+  const url='https://chatgpt.com/api/library/files/'+encodeURIComponent(source.libraryFileId)+'/download';
+  return `<div class="source-note"><strong>${revision.attachment?'Исходник в ChatGPT':'Исходник в ChatGPT · файл ещё не сохранён в приложении'}</strong><div style="overflow-wrap:anywhere;margin-top:4px">${esc(source.fileName)}</div><a class="source-link" href="${url}" target="_blank" rel="noopener noreferrer">Открыть исходник в ChatGPT ↗</a>${revision.attachment?'':'<div class="muted" style="font-size:11px;margin-top:5px">Скачай исходник и прикрепи к этой редакции. Ссылка сама по себе не является сохранённым вложением.</div>'}</div>`;
+}
+function openRename(type,id,button) {
+  if(busy||stale||!snapshot)return;
+  const item=(type==='project'?snapshot.projects:snapshot.documents).find(item=>item.id===id);
+  if(!item)return;
+  renameTarget={type,id};renameFocus=button;
+  $('renameTitle').textContent=type==='project'?'Название проекта':'Название документа';
+  $('renameHelp').textContent=type==='project'?'Все документы, редакции и файлы останутся в этом проекте.':'Все редакции, файлы и ссылки на исходники останутся у этого документа.';
+  $('renameName').value=item.name;$('renameError').hidden=true;
+  if(typeof $('renameDialog').showModal==='function')$('renameDialog').showModal();else $('renameDialog').setAttribute('open','');
+  controls();$('renameName').focus();$('renameName').select();
+}
+function closeRename() {
+  if(busy)return;
+  if(typeof $('renameDialog').close==='function')$('renameDialog').close();else $('renameDialog').removeAttribute('open');
+  renameTarget=null;
+  if(renameFocus?.isConnected)renameFocus.focus();else $('projectName').focus();
+  renameFocus=null;
+}
 function render() {
   if(!snapshot)return;
+  rebuildIndex();
   $('projectCount').textContent=snapshot.projects.length;
   $('documentCount').textContent=snapshot.documents.length;
   $('projectSummary').textContent=snapshot.revisions.length+' редакций в архиве';
   $('projectList').innerHTML=snapshot.projects.length?snapshot.projects.map(p=>{
-    const groups=snapshot.documents.filter(d=>d.projectId===p.id);
-    const ids=new Set(groups.map(d=>d.id));
-    return `<button class="project-card" data-project="${esc(p.id)}"><span class="project-title">${esc(p.name)}</span><span class="project-meta">Документов: ${groups.length} · Редакций: ${snapshot.revisions.filter(r=>ids.has(r.documentId)).length}</span><span class="open-project">Открыть документы →</span></button>`;
+    const groups=index.documentsByProject.get(p.id)||[];
+    let revisions=0,attached=0,sources=0;
+    for(const group of groups)for(const revision of index.revisionsByDocument.get(group.id)||[]){revisions++;if(revision.attachment)attached++;if(revision.source&&!revision.attachment)sources++;}
+    return `<article class="project-card"><div class="project-title">${esc(p.name)}</div><div class="project-meta">Документов: ${groups.length} · Редакций: ${revisions}<br>Сохранённых файлов: ${attached} · Исходников без файла: ${sources}</div><div class="actions"><button class="small primary" data-project="${esc(p.id)}">Открыть</button><button class="small ghost" data-rename-project="${esc(p.id)}" aria-label="Переименовать проект ${esc(p.name)}">Переименовать</button></div></article>`;
   }).join(''):'<div class="empty"><strong>Начни с первого проекта</strong><p>Собери документы и редакции одной конструкции в общем рабочем пространстве.</p></div>';
   fillProjects('docProject');fillProjects('projectFilter',true);
   if(activeDocument) {
@@ -140,25 +181,31 @@ function render() {
     else {activeDocument=null;$('revisionFormLabel').textContent='Документ отсутствует в перечитанном каталоге';$('revisionFormTitle').textContent='Черновик редакции';$('cancelRevision').hidden=false;}
   }
   renderDocuments();
-  $('backupStats').innerHTML=`<div><strong>${snapshot.projects.length}</strong><span>проектов</span></div><div><strong>${snapshot.revisions.length}</strong><span>редакций</span></div><div><strong>${attachmentCount()}</strong><span>файлов · ${bytes(attachmentSize())}</span></div>`;
+  $('backupStats').innerHTML=`<div><strong>${snapshot.projects.length}</strong><span>проектов</span></div><div><strong>${snapshot.revisions.length}</strong><span>редакций</span></div><div><strong>${attachmentCount()}</strong><span>сохранённых файлов · ${bytes(attachmentSize())}</span></div><div><strong>${snapshot.revisions.filter(r=>r.source).length}</strong><span>ссылок на исходники</span></div>`;
   $('eventList').innerHTML=snapshot.events?.length?snapshot.events.map(event=>`<div class="revision"><div style="overflow-wrap:anywhere">${esc(event.text)}</div><div class="muted" style="font-size:11px;margin-top:4px">${esc(/^\d{4}-\d{2}-\d{2}T/.test(event.date)?date(event.date):event.date)}</div></div>`).join(''):'<div class="empty"><strong>Журнал пока пуст</strong><p>Здесь появятся события работы с архивом.</p></div>';
   controls();
 }
 function renderDocuments() {
   if(!snapshot)return;
   const project=$('projectFilter').value;
+  const sourceFilter=$('sourceFilter').value;
   const query=$('search').value.trim().toLocaleLowerCase('ru-RU');
   const groups=snapshot.documents.filter(d=>{
     if(project&&d.projectId!==project)return false;
-    const name=snapshot.projects.find(p=>p.id===d.projectId)?.name||'';
-    const revs=snapshot.revisions.filter(r=>r.documentId===d.id);
-    return [d.name,d.format,name,...revs.flatMap(r=>[r.revision,r.status,r.attachment?.name||''])].join(' ').toLocaleLowerCase('ru-RU').includes(query);
+    const name=index.projectNames.get(d.projectId)||'';
+    const revs=index.revisionsByDocument.get(d.id)||[];
+    if(sourceFilter==='attached'&&!revs.some(revision=>revision.attachment))return false;
+    if(sourceFilter==='source'&&!revs.some(revision=>revision.source&&!revision.attachment))return false;
+    return [d.name,d.format,name,...revs.flatMap(r=>[r.revision,r.status,r.attachment?.name||'',r.source?.fileName||''])].join(' ').toLocaleLowerCase('ru-RU').includes(query);
   });
-  $('documentList').innerHTML=groups.length?groups.map(group=>{
-    const revisions=snapshot.revisions.filter(r=>r.documentId===group.id).map((r,i)=>({...r,order:i})).sort((a,b)=>Date.parse(b.createdAt)-Date.parse(a.createdAt)||b.order-a.order);
+  const visible=groups.slice(0,documentPage*PAGE_SIZE);
+  $('documentSummary').textContent='Показано документов: '+visible.length+' из '+groups.length;
+  $('showMoreDocuments').hidden=visible.length>=groups.length;
+  $('documentList').innerHTML=groups.length?visible.map(group=>{
+    const revisions=(index.revisionsByDocument.get(group.id)||[]).map((r,i)=>({...r,order:i})).sort((a,b)=>Date.parse(b.createdAt)-Date.parse(a.createdAt)||b.order-a.order);
     const latestUpload=revisions.find(r=>r.attachment);
-    const pname=snapshot.projects.find(p=>p.id===group.projectId)?.name||'';
-    return `<article class="doc-card"><div class="doc-title"><div class="title-line"><div><h3>${esc(group.name)}</h3><div class="muted">${esc(pname)} · ${revisions.length} редакций</div></div><span class="format">${esc(group.format)}</span></div></div>${revisions.map(r=>`<div class="revision"><div class="revision-top"><div><span class="revision-code">${esc(r.revision)}</span><div class="badges">${r.id===revisions[0]?.id?'<span class="badge">Последняя зарегистрированная</span>':''}${r.id===latestUpload?.id?'<span class="badge gold">Последняя с файлом</span>':''}${r.status==='Разрешено к выдаче'?'<span class="badge green">Выдача: отметка пользователя</span>':''}</div></div><label class="status-control-wrap"><span class="muted" style="font-size:10px">Статус пользователя</span><select class="status-control" aria-label="Статус ${esc(r.revision)}" data-action="status" data-id="${esc(r.id)}">${store.STATUSES.map(status=>`<option${r.status===status?' selected':''}${status==='Разрешено к выдаче'&&!r.attachment?' disabled':''}>${esc(status)}</option>`).join('')}</select></label></div><div class="muted" style="font-size:11px;margin-bottom:8px">Зарегистрировано ${esc(date(r.createdAt))}</div>${r.attachment?`<div class="file-name">${esc(r.attachment.name)}</div><div class="file-meta">${bytes(r.attachment.size)} · Файл закреплён за редакцией</div><details><summary class="file-meta">Контрольная сумма SHA‑256</summary><code class="hash">${esc(r.attachment.sha256)}</code></details><div class="actions"><button class="small ghost" data-action="download" data-id="${esc(r.id)}">Скачать файл</button></div>`:'<div class="muted">Файл ещё не прикреплён.</div><div class="actions"><button class="small ghost" data-action="attach" data-id="'+esc(r.id)+'">Прикрепить файл</button></div>'}</div>`).join('')}<div class="doc-bottom"><button class="small ghost" data-action="newRevision" data-id="${esc(group.id)}">+ Новая редакция</button></div></article>`;
+    const pname=index.projectNames.get(group.projectId)||'';
+    return `<article class="doc-card"><div class="doc-title"><div class="title-line"><div><h3>${esc(group.name)}</h3><div class="muted">${esc(pname)} · ${revisions.length} редакций</div></div><span class="format">${esc(group.format)}</span></div></div>${revisions.map(r=>`<div class="revision"><div class="revision-top"><div><span class="revision-code">${esc(r.revision)}</span><div class="badges">${r.id===revisions[0]?.id?'<span class="badge">Последняя зарегистрированная</span>':''}${r.id===latestUpload?.id?'<span class="badge gold">Последняя с файлом</span>':''}${r.status==='Разрешено к выдаче'?'<span class="badge green">Выдача: отметка пользователя</span>':''}</div></div><label class="status-control-wrap"><span class="muted" style="font-size:10px">Статус пользователя</span><select class="status-control" aria-label="Статус ${esc(r.revision)}" data-action="status" data-id="${esc(r.id)}">${store.STATUSES.map(status=>`<option${r.status===status?' selected':''}${status==='Разрешено к выдаче'&&!r.attachment?' disabled':''}>${esc(status)}</option>`).join('')}</select></label></div><div class="muted" style="font-size:11px;margin-bottom:8px">Зарегистрировано ${esc(date(r.createdAt))}</div>${sourceMarkup(r)}${r.attachment?`<div class="file-name">${esc(r.attachment.name)}</div><div class="file-meta">${bytes(r.attachment.size)} · Файл закреплён за редакцией</div><details><summary class="file-meta">Контрольная сумма SHA‑256</summary><code class="hash">${esc(r.attachment.sha256)}</code></details><div class="actions"><button class="small ghost" data-action="download" data-id="${esc(r.id)}">Скачать файл</button></div>`:'<div class="muted">Файл ещё не прикреплён.</div><div class="actions"><button class="small ghost" data-action="attach" data-id="'+esc(r.id)+'">Прикрепить файл</button></div>'}</div>`).join('')}<div class="doc-bottom"><button class="small ghost" data-action="newRevision" data-id="${esc(group.id)}">+ Новая редакция</button><button class="small ghost" data-action="renameDocument" data-id="${esc(group.id)}">Переименовать</button></div></article>`;
   }).join(''):`<div class="empty"><strong>${snapshot.documents.length?'Ничего не найдено':'Документов пока нет'}</strong><p>${snapshot.documents.length?'Измени поиск или фильтр по проекту.':'Зарегистрируй первую редакцию и прикрепи к ней файл.'}</p></div>`;
   controls();
 }
@@ -178,7 +225,7 @@ async function run(action, success, after) {
     if(after)after();
     preparedBackup=null;$('backupFile').value='';$('backupPreview').textContent='';
     preparedLegacy=null;$('legacyFile').value='';$('legacyPreview').textContent='';
-    render();notice(success,'success');void refreshPrevious();return true;
+    render();notice(typeof success==='function'?success():success,'success');void refreshPrevious();return true;
   } catch(error) {showError(error);render();return false;}
   finally {busy=false;controls();}
 }
@@ -187,6 +234,53 @@ function download(blob,name) {
   link.href=url;link.download=name;document.body.append(link);link.click();link.remove();
   setTimeout(()=>URL.revokeObjectURL(url),30000);
 }
+$('renameForm').addEventListener('submit',async event=>{
+  event.preventDefault();
+  if(!renameTarget||busy||stale)return;
+  const name=$('renameName').value.trim(),target={...renameTarget};
+  if(!name){$('renameError').textContent='Укажи название.';$('renameError').hidden=false;return;}
+  $('renameError').hidden=true;
+  const success=await run(expectedVersion=>target.type==='project'?store.renameProject({projectId:target.id,name,expectedVersion}):store.renameDocument({documentId:target.id,name,expectedVersion}),'Название сохранено. Документы, редакции и файлы остались на месте.');
+  if(success)closeRename();else{$('renameError').textContent=$('message').textContent;$('renameError').hidden=false;$('renameName').focus();}
+});
+$('cancelRename').addEventListener('click',closeRename);
+$('renameDialog').addEventListener('cancel',event=>{event.preventDefault();closeRename();});
+$('renameDialog').addEventListener('keydown',event=>{
+  if(event.key!=='Tab')return;
+  const focusable=[...$('renameDialog').querySelectorAll('input,button')].filter(element=>!element.disabled);
+  const first=focusable[0],last=focusable.at(-1);
+  if(!first){event.preventDefault();return;}
+  if(event.shiftKey&&document.activeElement===first){event.preventDefault();last.focus();}
+  else if(!event.shiftKey&&document.activeElement===last){event.preventDefault();first.focus();}
+});
+$('catalogFile').addEventListener('change',async event=>{
+  const file=event.target.files[0];preparedCatalog=null;$('catalogPreview').textContent='';$('catalogReceipt').textContent='';
+  if(!file||busy){controls();return;}
+  busy=true;controls();
+  try{
+    if(file.size>20*1024*1024)throw Error('Каталог проектов больше 20 МиБ.');
+    const pack=JSON.parse(await readText(file));
+    if(pack.app!=='RRR'||pack.kind!=='project-catalog'||pack.schemaVersion!==1||!Array.isArray(pack.projects)||!Array.isArray(pack.documents)||!Array.isArray(pack.revisions))throw Error('Ожидается каталог проектов: project-catalog, проекты, документы и редакции.');
+    preparedCatalog=pack;
+    $('catalogPreview').textContent='По описанию каталога: '+pack.projects.length+' проектов, '+pack.documents.length+' документов, '+pack.revisions.length+' редакций. Полная проверка связей и источников будет выполнена до добавления. Содержимое файлов в этом каталоге не хранится.';
+    notice('Каталог выбран. Добавление сохранит существующие названия, статусы и вложения.');
+  }catch(error){event.target.value='';showError(error,'Не удалось прочитать каталог проектов');$('catalogPreview').textContent=$('message').textContent;}
+  finally{busy=false;controls();}
+});
+$('mergeCatalog').addEventListener('click',async()=>{
+  if(!preparedCatalog||busy||stale)return;
+  if(!confirm('Добавить проекты, документы и ссылки на исходники из каталога? Существующие названия, статусы и файлы сохранятся. Перед добавлением новых записей сохранится предыдущий снимок архива. Повторные записи не будут добавлены ещё раз.'))return;
+  const pack=preparedCatalog;let report;
+  const success=await run(async expectedVersion=>{
+    const result=await store.mergeCatalogPack({pack,expectedVersion});report=result.report;return result.snapshot;
+  },()=>`Каталог обработан. Добавлено: проектов ${report.addedProjects}, документов ${report.addedDocuments}, редакций ${report.addedRevisions}. Уже были в архиве: проектов ${report.skippedProjects}, документов ${report.skippedDocuments}, редакций ${report.skippedRevisions}.`);
+  if(success){
+    preparedCatalog=null;$('catalogFile').value='';$('catalogPreview').textContent='';
+    const conflicts=Array.isArray(report.sourceConflicts)?report.sourceConflicts.length:Number(report.sourceConflicts)||0;
+    $('catalogReceipt').textContent=$('message').textContent+(conflicts?' Не заменено ссылок на исходники из-за различий: '+conflicts+'. Существующие данные сохранены.':' Существующие данные сохранены.');
+    controls();
+  }else $('catalogReceipt').textContent=$('message').textContent;
+});
 for(const button of document.querySelectorAll('[data-tab]'))button.addEventListener('click',()=>showTab(button.dataset.tab));
 $('addProject').addEventListener('click',()=>{
   const name=$('projectName').value.trim();
@@ -194,10 +288,11 @@ $('addProject').addEventListener('click',()=>{
   return run(expectedVersion=>store.addProject({name,expectedVersion}),'Проект сохранён.',()=>{$('projectName').value='';});
 });
 $('projectList').addEventListener('click',event=>{
-  const button=event.target.closest('[data-project]');if(!button)return;
+  const rename=event.target.closest('[data-rename-project]');if(rename){openRename('project',rename.dataset.renameProject,rename);return;}
+  const button=event.target.closest('[data-project]');if(!button||busy||stale)return;
   $('projectFilter').value=button.dataset.project;
   if(!activeDocument)$('docProject').value=button.dataset.project;
-  $('search').value='';renderDocuments();showTab('documents');
+  $('search').value='';documentPage=1;renderDocuments();showTab('documents');
 });
 $('addRevision').addEventListener('click',()=>{
   const projectId=$('docProject').value,name=$('docName').value.trim(),format=$('docFormat').value,revision=$('docRevision').value.trim();
@@ -205,8 +300,10 @@ $('addRevision').addEventListener('click',()=>{
   return run(expectedVersion=>store.addRevision({projectId,name,format,revision,expectedVersion}),'Редакция сохранена. Теперь можно прикрепить файл.',()=>{$('docRevision').value='';});
 });
 $('cancelRevision').addEventListener('click',()=>{resetRevisionForm();controls();});
-$('search').addEventListener('input',renderDocuments);
-$('projectFilter').addEventListener('change',renderDocuments);
+$('search').addEventListener('input',()=>{documentPage=1;renderDocuments();});
+$('projectFilter').addEventListener('change',()=>{documentPage=1;renderDocuments();});
+$('sourceFilter').addEventListener('change',()=>{documentPage=1;renderDocuments();});
+$('showMoreDocuments').addEventListener('click',()=>{documentPage++;renderDocuments();});
 $('documentList').addEventListener('change',event=>{
   const select=event.target.closest('[data-action="status"]');if(!select)return;
   const revision=snapshot.revisions.find(r=>r.id===select.dataset.id);
@@ -218,6 +315,7 @@ $('documentList').addEventListener('change',event=>{
 $('documentList').addEventListener('click',async event=>{
   const button=event.target.closest('button[data-action]');if(!button||busy||stale)return;
   const id=button.dataset.id;
+  if(button.dataset.action==='renameDocument'){openRename('document',id,button);return;}
   if(button.dataset.action==='newRevision') {
     const group=snapshot.documents.find(d=>d.id===id);if(!group)return;
     if(($('docName').value.trim()||$('docRevision').value.trim())&&!confirm('Перейти к новой редакции выбранного документа? Введённые поля формы будут заменены.'))return;
@@ -246,7 +344,7 @@ $('exportBackup').addEventListener('click',async()=>{
   if(busy||!snapshot||stale)return;busy=true;controls();notice('Проверяем вложения и готовим полную копию…');
   try {
     const backup=await store.exportBackup();
-    download(new Blob([JSON.stringify(backup)],{type:'application/json'}),'IGNIS_PRO_R05_full_'+stamp()+'.json');
+    download(new Blob([JSON.stringify(backup)],{type:'application/json'}),'IGNIS_PRO_R06_full_'+stamp()+'.json');
     notice('Полная копия подготовлена: '+backup.snapshot.projects.length+' проектов, '+backup.snapshot.revisions.length+' редакций, '+backup.manifest.length+' файлов. Размеры и SHA‑256 вложений проверены. Сохрани файл вне приложения.','success');
   } catch(error){showError(error,'Не удалось подготовить копию');}
   finally{busy=false;controls();}
@@ -260,7 +358,7 @@ $('backupFile').addEventListener('change',async event=>{
     if(file.size>maxBackup)throw Error('Файл копии больше '+bytes(maxBackup));
     const text=await readText(file);
     const backup=JSON.parse(text);
-    if(backup.app!=='RRR'||backup.kind!=='full'||backup.schemaVersion!==1||!Array.isArray(backup.snapshot?.projects)||!Array.isArray(backup.snapshot?.documents)||!Array.isArray(backup.snapshot?.revisions)||!Array.isArray(backup.manifest))throw Error('Это не полная резервная копия R05. Для каталога R04 используй отдельный перенос.');
+    if(backup.app!=='RRR'||backup.kind!=='full'||![1,2].includes(backup.schemaVersion)||!Array.isArray(backup.snapshot?.projects)||!Array.isArray(backup.snapshot?.documents)||!Array.isArray(backup.snapshot?.revisions)||!Array.isArray(backup.manifest))throw Error('Это не полная резервная копия архива. Для каталога R04 используй отдельный перенос.');
     preparedBackup=backup;
     $('backupPreview').textContent='По описанию копии: '+backup.snapshot.projects.length+' проектов, '+backup.snapshot.documents.length+' документов, '+backup.snapshot.revisions.length+' редакций, '+backup.manifest.length+' файлов. Полная проверка структуры, связей, размеров и SHA‑256 будет выполнена перед записью.';
     restoreText('Файл прочитан. Готово к проверке и восстановлению.');
@@ -291,7 +389,7 @@ $('restorePrevious').addEventListener('click',async()=>{
 });
 $('importLegacy').addEventListener('click',()=>{
   if(busy||stale)return;
-  if(!confirm('Перенести проекты, карточки документов и журнал R04 в пустой R05? Прежний каталог R04 останется без изменений. Оригиналов файлов в нём нет.'))return;
+  if(!confirm('Перенести проекты, карточки документов и журнал R04 в пустой архив R06? Прежний каталог R04 останется без изменений. Оригиналов файлов в нём нет.'))return;
   return run(expectedVersion=>store.importLegacy({expectedVersion}),'Каталог R04 перенесён. Прежние данные не изменены. Прикрепи оригиналы файлов к нужным редакциям.');
 });
 $('legacyFile').addEventListener('change',async event=>{
@@ -310,7 +408,7 @@ $('legacyFile').addEventListener('change',async event=>{
 });
 $('importLegacyFile').addEventListener('click',()=>{
   if(!preparedLegacy||busy||stale)return;
-  if(!confirm('Перенести выбранный каталог R04 в пустой R05? Будут перенесены проекты, карточки документов и журнал. Исходный файл и прежний каталог не изменятся.'))return;
+  if(!confirm('Перенести выбранный каталог R04 в пустой архив R06? Будут перенесены проекты, карточки документов и журнал. Исходный файл и прежний каталог не изменятся.'))return;
   const raw=preparedLegacy;
   return run(expectedVersion=>store.importLegacy({expectedVersion,raw}),'Каталог из файла R04 перенесён. Прикрепи оригиналы файлов к нужным редакциям.');
 });
