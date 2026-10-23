@@ -1,4 +1,5 @@
-import * as store from './store.js?v=0.6.1';
+import * as store from './store.js?v=0.7.0';
+import { buildFilePlan } from './batch.js?v=0.7.0';
 
 const $ = id => document.getElementById(id);
 const esc = value => String(value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -10,6 +11,8 @@ let previousRequest=0, restoreOperation=null;
 let renameTarget=null, renameFocus=null, preparedCatalog=null;
 const PAGE_SIZE=40;
 let documentPage=1, index={projectNames:new Map(),documentsByProject:new Map(),revisionsByDocument:new Map()};
+let batchRows=[],batchRunning=false,batchController=null,batchCancelRequested=false,batchTargetRow=null,batchTargetPage=1,storageInfoRequest=0;
+const extensionMap={PDF:['pdf'],STEP:['step','stp'],DWG:['dwg'],DXF:['dxf'],SLDPRT:['sldprt'],XLSX:['xlsx']};
 
 function restoreText(text,kind='') {
   $('restoreProgress').hidden=false;
@@ -20,12 +23,12 @@ function updateRestoreDock() {
   if(!restoreOperation)return;
   const seconds=Math.floor((Date.now()-restoreOperation.started)/1000);
   const text=restoreOperation.text+(seconds?'\nПрошло '+seconds+' с.':'');
-  restoreText(text);
+  if(restoreOperation.kind==='batch')batchText(text);else restoreText(text);
   $('operationDock').textContent=text;
 }
-function startRestore(text) {
+function startRestore(text,kind='restore') {
   if(restoreOperation)clearInterval(restoreOperation.timer);
-  restoreOperation={text,started:Date.now()};
+  restoreOperation={text,started:Date.now(),kind};
   restoreOperation.timer=setInterval(updateRestoreDock,1000);
   $('operationDock').hidden=false;
   notice(text);updateRestoreDock();
@@ -39,9 +42,10 @@ function restoreStage(progress) {
   updateRestoreDock();
 }
 function finishRestore(success) {
+  const kind=restoreOperation?.kind;
   if(restoreOperation)clearInterval(restoreOperation.timer);
   restoreOperation=null;$('operationDock').hidden=true;
-  restoreText($('message').textContent,success?'success':'error');
+  if(kind==='batch')batchText($('message').textContent,success?'success':'error');else restoreText($('message').textContent,success?'success':'error');
 }
 function readText(file) {
   return new Promise((resolve,reject)=>{
@@ -94,14 +98,22 @@ function controls() {
   $('cancelRename').disabled=busy;
   for(const button of $('projectList').querySelectorAll('button'))button.disabled=disabled;
   $('showMoreDocuments').disabled=busy;
+  $('batchFiles').disabled=disabled;
+  $('clearBatch').disabled=busy||!batchRows.length;
+  $('runBatch').disabled=disabled||!batchValidity().ready;
+  $('cancelBatch').hidden=!batchRunning;
+  $('cancelBatch').disabled=!batchRunning||batchCancelRequested;
+  $('cancelBatch').textContent=batchCancelRequested?'Останавливаем…':'Отменить пакет';
+  for(const button of $('batchPreview').querySelectorAll('button'))button.disabled=disabled;
+  for(const button of $('batchTargetList').querySelectorAll('button'))button.disabled=disabled||button.dataset.unavailable==='true';
   document.body.setAttribute('aria-busy',String(busy));
 }
 function showError(error, prefix='Операция не выполнена') {
   if(error?.code==='STALE') stale=true;
   if(error?.code==='UNCERTAIN'){stale=true;uncertain=true;}
   let detail=error?.message||String(error);
-  if(/blob.*(?:prepar|serializ)|(?:prepar|serializ).*blob/i.test(detail)) {reloadSuggested=true;detail='Safari не смог подготовить вложение к сохранению прежним способом. Проверь, что в шапке указана R06.1, закрой прежнюю вкладку и открой приложение заново. Затем повторно выбери тот же файл резервной копии. Не очищай данные Safari.';}
-  else if(error?.name==='DataCloneError') {reloadSuggested=true;detail='Браузер не смог подготовить данные для локального сохранения. Проверь версию R06.1 в шапке и открой приложение заново. Файл резервной копии можно выбрать повторно; не очищай данные браузера.';}
+  if(/blob.*(?:prepar|serializ)|(?:prepar|serializ).*blob/i.test(detail)) {reloadSuggested=true;detail='Safari не смог подготовить вложение к сохранению прежним способом. Проверь, что в шапке указана R07, закрой прежнюю вкладку и открой приложение заново. Затем повторно выбери тот же файл резервной копии. Не очищай данные Safari.';}
+  else if(error?.name==='DataCloneError') {reloadSuggested=true;detail='Браузер не смог подготовить данные для локального сохранения. Проверь версию R07 в шапке и открой приложение заново. Файл резервной копии можно выбрать повторно; не очищай данные браузера.';}
   else if(error?.name==='QuotaExceededError') detail='На устройстве недостаточно доступного места. Данные операции не сохранены. Освободи место и попробуй ещё раз.';
   else if(error?.name==='SecurityError') detail='Браузер запретил доступ к локальному хранилищу. Проверь настройки Safari.';
   else if(error?.name==='UnknownError'||error?.name==='InvalidStateError') {reloadSuggested=true;detail='Браузер не смог выполнить операцию с локальным хранилищем. Закрой другие вкладки приложения и перечитай каталог перед повторной попыткой. Исходный файл резервной копии не изменялся. Не очищай данные браузера.';}
@@ -117,7 +129,7 @@ async function refreshPrevious() {
     const result=await store.getPreviousInfo();
     if(request!==previousRequest)return;
     previous=result;
-    $('previousInfo').textContent=previous.available ? `${previous.projects} проектов · ${previous.documents} документов · ${previous.revisions} редакций. Восстановление заменит весь текущий архив, включая файлы и последующие изменения.` : 'Снимка пока нет. Он появится перед первым удалением, восстановлением, переносом R04 или добавлением новых записей из каталога.';
+    $('previousInfo').textContent=previous.available ? `${previous.projects} проектов · ${previous.documents} документов · ${previous.revisions} редакций. Восстановление заменит весь текущий архив, включая файлы и последующие изменения.` : 'Снимка пока нет. Он появится перед первым удалением, восстановлением, пакетной загрузкой, переносом R04 или добавлением новых записей из каталога.';
   } catch(error) {
     if(request!==previousRequest)return;
     previous=null;
@@ -133,8 +145,95 @@ function fillProjects(id, all=false) {
 }
 function attachmentCount(){return snapshot.revisions.filter(r=>r.attachment).length;}
 function attachmentSize(){return snapshot.revisions.reduce((sum,r)=>sum+(r.attachment?.size||0),0);}
+function matchesFormat(file,document) {
+  if(document?.format==='Другое')return true;
+  const name=file.name||'',extension=name.includes('.')?name.split('.').pop().toLowerCase():'';
+  return !!extensionMap[document?.format]?.includes(extension);
+}
+function targetLabel(revisionId) {
+  const revision=index.revisionsById?.get(revisionId),document=index.documentsById?.get(revision?.documentId);
+  if(!revision||!document)return 'Редакция больше не найдена в архиве';
+  return (index.projectNames.get(document.projectId)||'Проект')+' · '+document.name+' · '+revision.revision+' · '+document.format;
+}
+function rowIssue(row,targets) {
+  if(row.skipped)return '';
+  if(row.size>store.MAX_FILE_BYTES)return 'Файл больше '+bytes(store.MAX_FILE_BYTES)+'. Пропусти эту строку.';
+  if(!row.revisionId)return row.reason==='ambiguous'?'Найдено несколько исходников. Выбери редакцию вручную или пропусти.':row.reason==='occupied'?'Совпавшая редакция уже содержит прикреплённый файл. Выбери другую редакцию или пропусти.':'Редакция не назначена. Выбери её вручную или пропусти.';
+  const revision=index.revisionsById?.get(row.revisionId);
+  if(!revision)return 'Назначенная редакция больше не найдена. Выбери другую или пропусти.';
+  if(revision.attachment)return 'Назначенная редакция уже содержит прикреплённый файл. Он не будет заменён. Выбери другую редакцию или пропусти.';
+  if(!matchesFormat(row.file,index.documentsById?.get(revision.documentId)))return 'Расширение файла не соответствует формату документа.';
+  if(targets.get(row.revisionId)>1)return 'Эта редакция назначена нескольким файлам. Оставь один файл или выбери разные редакции.';
+  return '';
+}
+function batchValidity() {
+  const targets=new Map();for(const row of batchRows)if(!row.skipped&&row.revisionId)targets.set(row.revisionId,(targets.get(row.revisionId)||0)+1);
+  const selected=batchRows.filter(row=>!row.skipped),size=selected.reduce((sum,row)=>sum+row.size,0);
+  const issues=new Map(selected.map(row=>[row.index,rowIssue(row,targets)]));
+  const errors=[...issues.values()].filter(Boolean).length,existing=snapshot?attachmentSize():0;
+  return {selected,size,existing,issues,errors,ready:!!snapshot&&selected.length>0&&batchRows.length<=(store.MAX_BATCH_FILES||50)&&errors===0&&existing+size<=store.MAX_TOTAL_BYTES};
+}
+function batchText(text,kind='') {
+  $('batchProgress').hidden=false;$('batchProgress').textContent=text;$('batchProgress').className='restore-progress'+(kind?' '+kind:'');
+}
+function renderBatch() {
+  const validity=batchValidity();
+  $('batchSummary').textContent=batchRows.length?`В списке: ${batchRows.length}; к прикреплению: ${validity.selected.length}; пропущено: ${batchRows.length-validity.selected.length}. Сохранено сейчас: ${bytes(validity.existing)}; в выбранных строках: ${bytes(validity.size)}; всего после пакета: ${bytes(validity.existing+validity.size)} из ${bytes(store.MAX_TOTAL_BYTES)}.${validity.existing+validity.size>store.MAX_TOTAL_BYTES?' Превышен лимит: пропусти часть файлов.':''}${validity.errors?' Требуют решения: '+validity.errors+'.':''}`:'Выбери файлы, чтобы подготовить список. Ничего не прикрепляется до проверки и подтверждения.';
+  $('batchPreview').innerHTML=batchRows.map(row=>{
+    const issue=validity.issues.get(row.index)||'';
+    return `<div class="batch-row${row.skipped?' skipped':''}"><strong>${esc(row.fileName)}</strong><span class="muted"> · ${bytes(row.size)}</span><div class="row-state">${row.skipped?'Явно пропущено':row.revisionId?esc(targetLabel(row.revisionId)):'Редакция не выбрана'}</div>${!row.skipped&&!issue?'<div class="row-state">'+(row.manual?'Редакция выбрана вручную.':'Совпало имя исходника и размер. Проверь редакцию — содержимое ещё не проверялось.')+'</div>':''}${issue?'<div class="row-state row-error">'+esc(issue)+'</div>':''}<div class="actions">${row.skipped?`<button class="small ghost" data-batch-action="unskip" data-index="${row.index}">Вернуть в список</button>`:`${row.size<=store.MAX_FILE_BYTES?'<button class="small ghost" data-batch-action="choose" data-index="'+row.index+'">Выбрать редакцию</button>':''}<button class="small ghost" data-batch-action="skip" data-index="${row.index}">Пропустить</button>`}</div></div>`;
+  }).join('');
+}
+function renderBatchTargets() {
+  const row=batchRows.find(row=>row.index===batchTargetRow);if(!row||!snapshot)return;
+  const query=$('batchTargetQuery').value.trim().toLocaleLowerCase('ru-RU'),project=$('batchTargetProject').value;
+  const assigned=new Set(batchRows.filter(other=>other.index!==row.index&&!other.skipped&&other.revisionId).map(other=>other.revisionId));
+  const candidates=snapshot.revisions.filter(revision=>{
+    const document=index.documentsById.get(revision.documentId);
+    if(revision.attachment||!document||project&&document.projectId!==project||!matchesFormat(row.file,document))return false;
+    return [targetLabel(revision.id),revision.source?.fileName||''].join(' ').toLocaleLowerCase('ru-RU').includes(query);
+  }).sort((a,b)=>Number(row.candidateIds.includes(b.id))-Number(row.candidateIds.includes(a.id)));
+  const visible=candidates.slice(0,batchTargetPage*PAGE_SIZE);
+  $('batchTargetList').innerHTML=visible.length?visible.map(revision=>`<button class="batch-target ghost" data-pick-revision="${esc(revision.id)}" data-unavailable="${assigned.has(revision.id)}"${assigned.has(revision.id)?' disabled':''}>${esc(targetLabel(revision.id))}${assigned.has(revision.id)?'<div class="muted">Уже выбрана для другого файла в этом списке</div>':''}</button>`).join(''):'<p class="muted">Доступных редакций не найдено. Измени поиск или проект. Редакции с прикреплённым файлом и неподходящим форматом не предлагаются.</p>';
+  $('batchTargetMore').hidden=visible.length>=candidates.length;controls();
+}
+function openBatchTarget(rowIndex) {
+  if(busy||stale)return;
+  const row=batchRows.find(row=>row.index===rowIndex);if(!row)return;
+  batchTargetRow=rowIndex;batchTargetPage=1;$('batchTargetFile').textContent=row.fileName+' · '+bytes(row.size);
+  $('batchTargetQuery').value='';fillProjects('batchTargetProject',true);$('batchTargetProject').value='';renderBatchTargets();
+  if(typeof $('batchTargetDialog').showModal==='function')$('batchTargetDialog').showModal();else $('batchTargetDialog').setAttribute('open','');
+  $('batchTargetQuery').focus();
+}
+function closeBatchTarget() {
+  if(typeof $('batchTargetDialog').close==='function')$('batchTargetDialog').close();else $('batchTargetDialog').removeAttribute('open');
+  batchTargetRow=null;$('batchFiles').focus();
+}
+function batchStage(progress) {
+  if(!restoreOperation||restoreOperation.kind!=='batch')return;
+  const names={preflight:'Проверяем все файлы и назначения…',read:'Читаем выбранные файлы…',hash:'Рассчитываем SHA‑256…',write:'Проверки завершены. Сохраняем пакет и предыдущий снимок…'};
+  const count=Number.isFinite(progress?.total)&&progress.total>0?' ('+progress.completed+' из '+progress.total+')':'';
+  restoreOperation.text=(batchCancelRequested?'Отмена запрошена. Ожидаем безопасного завершения.\n':'')+(names[progress?.stage]||'Обрабатываем пакет…')+count;
+  updateRestoreDock();
+}
+function renderStorageInfo() {
+  $('storageInfo').textContent=snapshot?'Точный объём сохранённых вложений: '+bytes(attachmentSize())+' из '+bytes(store.MAX_TOTAL_BYTES)+'. Карточки исходников не считаются сохранёнными файлами.':'Каталог ещё не открыт; объём вложений неизвестен.';
+}
+async function refreshStorageEstimate() {
+  const request=++storageInfoRequest,storage=globalThis.navigator?.storage;
+  $('storageEstimate').textContent='Запрашиваем сведения браузера…';
+  const read=async method=>{
+    if(typeof storage?.[method]!=='function')return null;
+    let timer;try{return await Promise.race([Promise.resolve().then(()=>storage[method]()).catch(()=>null),new Promise(resolve=>{timer=setTimeout(()=>resolve(null),3000);})]);}finally{clearTimeout(timer);}
+  };
+  const [estimate,persisted]=await Promise.all([read('estimate'),read('persisted')]);
+  if(request!==storageInfoRequest)return;
+  const usage=estimate?.usage,quota=estimate?.quota;
+  const estimateText=Number.isFinite(usage)&&usage>=0&&Number.isFinite(quota)&&quota>=0?'Оценка браузера для всего сайта: занято '+bytes(usage)+', лимит '+bytes(quota)+'.':'Оценка занятого места и лимита браузера недоступна.';
+  $('storageEstimate').textContent=estimateText+' Постоянное хранилище: '+(persisted===true?'подтверждено браузером.':persisted===false?'не подтверждено браузером.':'неизвестно.');
+}
 function rebuildIndex() {
-  index={projectNames:new Map(snapshot.projects.map(project=>[project.id,project.name])),documentsByProject:new Map(),revisionsByDocument:new Map()};
+  index={projectNames:new Map(snapshot.projects.map(project=>[project.id,project.name])),documentsByProject:new Map(),revisionsByDocument:new Map(),documentsById:new Map(snapshot.documents.map(doc=>[doc.id,doc])),revisionsById:new Map(snapshot.revisions.map(revision=>[revision.id,revision]))};
   for(const doc of snapshot.documents){if(!index.documentsByProject.has(doc.projectId))index.documentsByProject.set(doc.projectId,[]);index.documentsByProject.get(doc.projectId).push(doc);}
   for(const revision of snapshot.revisions){if(!index.revisionsByDocument.has(revision.documentId))index.revisionsByDocument.set(revision.documentId,[]);index.revisionsByDocument.get(revision.documentId).push(revision);}
 }
@@ -154,7 +253,7 @@ async function deleteItem(type,id) {
   const active=snapshot.documents.find(doc=>doc.id===activeDocument);
   const clearsDraft=!!active&&(type==='project'?active.projectId===id:active.id===id);
   const title=type==='project'?'проект':'документ';
-  const confirmation=`Удалить ${title} «${item.name}» из приложения?\nДокументов: ${documents.length}; редакций: ${revisions.length}; сохранённых файлов: ${files.length} (${bytes(volume)}).\nИсходники ChatGPT останутся. Повторный импорт каталога может вернуть карточки.\nСохранится полный снимок с файлами. В разделе «Копия» можно вернуть ВЕСЬ архив, заменив последующие изменения. Снимок один: следующее удаление, импорт или восстановление заменит его.${clearsDraft?'\nОткрытая форма этого документа будет очищена.':''}`;
+  const confirmation=`Удалить ${title} «${item.name}» из приложения?\nДокументов: ${documents.length}; редакций: ${revisions.length}; сохранённых файлов: ${files.length} (${bytes(volume)}).\nИсходники ChatGPT останутся. Повторный импорт каталога может вернуть карточки.\nСохранится полный снимок с файлами. В разделе «Копия» можно вернуть ВЕСЬ архив, заменив последующие изменения. Снимок один: следующее удаление, импорт, пакетная загрузка или восстановление заменит его.${clearsDraft?'\nОткрытая форма этого документа будет очищена.':''}`;
   if(!confirm(confirmation))return;
   return run(expectedVersion=>type==='project'?store.deleteProject({projectId:id,expectedVersion}):store.deleteDocument({documentId:id,expectedVersion}),type==='project'?'Проект удалён из приложения. Предыдущий полный архив сохранён в разделе «Копия».':'Документ со всеми редакциями удалён из приложения. Предыдущий полный архив сохранён в разделе «Копия».',()=>{
     if(clearsDraft)resetRevisionForm();
@@ -201,6 +300,7 @@ function render() {
   renderDocuments();
   $('backupStats').innerHTML=`<div><strong>${snapshot.projects.length}</strong><span>проектов</span></div><div><strong>${snapshot.revisions.length}</strong><span>редакций</span></div><div><strong>${attachmentCount()}</strong><span>сохранённых файлов · ${bytes(attachmentSize())}</span></div><div><strong>${snapshot.revisions.filter(r=>r.source).length}</strong><span>карточек исходников</span></div>`;
   $('eventList').innerHTML=snapshot.events?.length?snapshot.events.map(event=>`<div class="revision"><div style="overflow-wrap:anywhere">${esc(event.text)}</div><div class="muted" style="font-size:11px;margin-top:4px">${esc(/^\d{4}-\d{2}-\d{2}T/.test(event.date)?date(event.date):event.date)}</div></div>`).join(''):'<div class="empty"><strong>Журнал пока пуст</strong><p>Здесь появятся события работы с архивом.</p></div>';
+  renderBatch();renderStorageInfo();
   controls();
 }
 function renderDocuments() {
@@ -252,6 +352,66 @@ function download(blob,name) {
   link.href=url;link.download=name;document.body.append(link);link.click();link.remove();
   setTimeout(()=>URL.revokeObjectURL(url),30000);
 }
+$('batchFiles').addEventListener('change',event=>{
+  if(busy||stale||!snapshot)return;
+  const files=Array.from(event.target.files||[]);if(!files.length)return;
+  if(files.length>(store.MAX_BATCH_FILES||50)){event.target.value='';notice('Выбери не больше '+(store.MAX_BATCH_FILES||50)+' файлов в одном пакете.','error');return;}
+  if(batchRows.length&&!confirm('Заменить текущий список выбранными файлами? Файлы из прежнего списка ещё не прикрепляются и не удаляются.')){event.target.value='';return;}
+  try{
+    batchRows=buildFilePlan(snapshot,files,{maxFileBytes:store.MAX_FILE_BYTES}).map(row=>({...row,skipped:false,manual:false,candidateIds:row.candidateIds||[]}));
+    $('batchProgress').hidden=true;renderBatch();controls();
+    notice('Список подготовлен. Проверь каждую редакцию; неразрешённые строки назначь вручную или явно пропусти.');
+  }catch(error){event.target.value='';showError(error,'Не удалось подготовить пакет');}
+});
+$('batchPreview').addEventListener('click',event=>{
+  if(busy||stale)return;
+  const button=event.target.closest('[data-batch-action]');if(!button)return;
+  const row=batchRows.find(row=>row.index===Number(button.dataset.index));if(!row)return;
+  if(button.dataset.batchAction==='choose'){openBatchTarget(row.index);return;}
+  if(button.dataset.batchAction==='skip')row.skipped=true;
+  if(button.dataset.batchAction==='unskip')row.skipped=false;
+  renderBatch();controls();
+});
+$('clearBatch').addEventListener('click',()=>{
+  if(busy)return;
+  batchRows=[];$('batchFiles').value='';$('batchProgress').hidden=true;renderBatch();controls();
+});
+$('batchTargetQuery').addEventListener('input',()=>{batchTargetPage=1;renderBatchTargets();});
+$('batchTargetProject').addEventListener('change',()=>{batchTargetPage=1;renderBatchTargets();});
+$('batchTargetMore').addEventListener('click',()=>{batchTargetPage++;renderBatchTargets();});
+$('closeBatchTarget').addEventListener('click',closeBatchTarget);
+$('batchTargetDialog').addEventListener('cancel',event=>{event.preventDefault();closeBatchTarget();});
+$('batchTargetList').addEventListener('click',event=>{
+  if(busy||stale)return;
+  const button=event.target.closest('[data-pick-revision]');if(!button||button.disabled)return;
+  const row=batchRows.find(row=>row.index===batchTargetRow);if(!row)return;
+  row.revisionId=button.dataset.pickRevision;row.manual=true;row.skipped=false;
+  closeBatchTarget();renderBatch();controls();
+});
+$('runBatch').addEventListener('click',async()=>{
+  if(busy||stale||!snapshot)return;
+  const validity=batchValidity();
+  if(!validity.ready){batchText('Сначала разреши все строки, явно пропусти ненужные и проверь общий объём.','error');return;}
+  const items=validity.selected.map(row=>({revisionId:row.revisionId,file:row.file}));
+  const targets=validity.selected.slice(0,8).map(row=>'• '+row.fileName+' → '+targetLabel(row.revisionId)).join('\n');
+  if(!confirm(`Прикрепить ${items.length} файлов (${bytes(validity.size)}) к проверенным редакциям?\n${targets}${items.length>8?'\n…и ещё '+(items.length-8)+' назначений из списка.':''}\nПакет сохранится целиком. Имя и размер исходника не подтверждают содержимое; SHA‑256 будет рассчитан для выбранных файлов. Имеющиеся вложения не заменяются. Сохранится один полный предыдущий снимок, заменив прежний. Следующая пакетная загрузка, удаление, импорт или восстановление снова заменит его. Восстановление заменяет весь архив.`))return;
+  batchRunning=true;batchCancelRequested=false;batchController=new AbortController();
+  try{
+    const success=await run(async expectedVersion=>{
+      startRestore('Проверяем назначения и файлы пакета…','batch');
+      await new Promise(resolve=>setTimeout(resolve,0));
+      return store.attachFilesAtomic({items,expectedVersion,onProgress:batchStage,signal:batchController.signal});
+    },'Пакет сохранён целиком: '+items.length+' файлов. Для каждого рассчитан SHA‑256. Предыдущий полный архив доступен в разделе «Копия».',()=>{batchRows=[];$('batchFiles').value='';});
+    finishRestore(success);
+  }finally{batchRunning=false;batchController=null;batchCancelRequested=false;controls();}
+});
+$('cancelBatch').addEventListener('click',()=>{
+  if(!batchRunning||!batchController||batchCancelRequested)return;
+  batchCancelRequested=true;batchController.abort();
+  if(restoreOperation?.kind==='batch'){restoreOperation.text='Отмена запрошена. Ожидаем безопасного завершения текущей операции…';updateRestoreDock();}
+  controls();
+});
+$('refreshStorageInfo').addEventListener('click',()=>{renderStorageInfo();void refreshStorageEstimate();});
 $('renameForm').addEventListener('submit',async event=>{
   event.preventDefault();
   if(!renameTarget||busy||stale)return;
@@ -364,7 +524,7 @@ $('exportBackup').addEventListener('click',async()=>{
   if(busy||!snapshot||stale)return;busy=true;controls();notice('Проверяем вложения и готовим полную копию…');
   try {
     const backup=await store.exportBackup();
-    download(new Blob([JSON.stringify(backup)],{type:'application/json'}),'IGNIS_PRO_R06.1_full_'+stamp()+'.json');
+    download(new Blob([JSON.stringify(backup)],{type:'application/json'}),'IGNIS_PRO_R07_full_'+stamp()+'.json');
     notice('Полная копия подготовлена: '+backup.snapshot.projects.length+' проектов, '+backup.snapshot.revisions.length+' редакций, '+backup.manifest.length+' файлов. Размеры и SHA‑256 вложений проверены. Сохрани файл вне приложения.','success');
   } catch(error){showError(error,'Не удалось подготовить копию');}
   finally{busy=false;controls();}
@@ -409,7 +569,7 @@ $('restorePrevious').addEventListener('click',async()=>{
 });
 $('importLegacy').addEventListener('click',()=>{
   if(busy||stale)return;
-  if(!confirm('Перенести проекты, карточки документов и журнал R04 в пустой архив R06.1? Прежний каталог R04 останется без изменений. Оригиналов файлов в нём нет.'))return;
+  if(!confirm('Перенести проекты, карточки документов и журнал R04 в пустой архив R07? Прежний каталог R04 останется без изменений. Оригиналов файлов в нём нет.'))return;
   return run(expectedVersion=>store.importLegacy({expectedVersion}),'Каталог R04 перенесён. Прежние данные не изменены. Прикрепи оригиналы файлов к нужным редакциям.');
 });
 $('legacyFile').addEventListener('change',async event=>{
@@ -428,14 +588,14 @@ $('legacyFile').addEventListener('change',async event=>{
 });
 $('importLegacyFile').addEventListener('click',()=>{
   if(!preparedLegacy||busy||stale)return;
-  if(!confirm('Перенести выбранный каталог R04 в пустой архив R06.1? Будут перенесены проекты, карточки документов и журнал. Исходный файл и прежний каталог не изменятся.'))return;
+  if(!confirm('Перенести выбранный каталог R04 в пустой архив R07? Будут перенесены проекты, карточки документов и журнал. Исходный файл и прежний каталог не изменятся.'))return;
   const raw=preparedLegacy;
   return run(expectedVersion=>store.importLegacy({expectedVersion,raw}),'Каталог из файла R04 перенесён. Прикрепи оригиналы файлов к нужным редакциям.');
 });
 async function load(first=false) {
   if(busy)return;busy=true;controls();notice('Открываем локальный архив…');
   try {
-    snapshot=await(first?store.init():store.readSnapshot());stale=false;uncertain=false;reloadSuggested=false;render();void refreshPrevious();document.body.dataset.ready='true';notice(first?'Архив открыт. Данные хранятся локально на этом устройстве.':'Каталог перечитан. Введённые поля сохранены.','success');
+    snapshot=await(first?store.init():store.readSnapshot());stale=false;uncertain=false;reloadSuggested=false;render();void refreshPrevious();void refreshStorageEstimate();document.body.dataset.ready='true';notice(first?'Архив открыт. Данные хранятся локально на этом устройстве.':'Каталог перечитан. Введённые поля сохранены. Выбранные файлы пакета сохранены в списке; назначения проверены по текущим редакциям.','success');
     if(!$('restoreProgress').hidden)restoreText('Каталог перечитан. На экране показано фактическое сохранённое состояние.','success');
   } catch(error){showError(error,'Не удалось открыть архив');$('reloadRow').hidden=false;}
   finally{busy=false;controls();}
