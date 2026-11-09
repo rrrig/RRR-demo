@@ -1,0 +1,59 @@
+name: Проверка данных
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (ветка PR / main)
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Checkout базовой ветки в base/
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.base_ref }}
+          path: base
+          persist-credentials: false
+
+      - name: Checkout предыдущего состояния main в base/
+        if: github.event_name == 'push' && github.event.before != '0000000000000000000000000000000000000000'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.before }}
+          path: base
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Проверка (push в main)
+        if: github.event_name != 'pull_request'
+        run: |
+          if [ -d base ]; then node tools/validate.mjs --base base; else node tools/validate.mjs; fi
+
+      # Проверка запускается из БАЗОВОЙ ветки, чтобы PR не мог ослабить её, изменив tools/.
+      # Проекты читаются из текущей папки (ветка PR), базовые данные — из base/.
+      - name: Проверка PR (валидатор из базовой ветки)
+        if: github.event_name == 'pull_request'
+        run: |
+          if [ -f base/tools/validate.mjs ]; then
+            node base/tools/validate.mjs --base base
+          else
+            echo "::warning::В базовой ветке нет tools/validate.mjs — используется версия из PR (первичная настройка)."
+            node tools/validate.mjs --base base
+          fi

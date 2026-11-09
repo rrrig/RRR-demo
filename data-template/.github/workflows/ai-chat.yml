@@ -1,0 +1,68 @@
+name: ИИ в чате проекта
+
+# Отвечает в чат проекта, когда в новом сообщении есть @Claude, @ChatGPT или @все.
+# Коммиты, сделанные с GITHUB_TOKEN, не запускают workflow повторно — бесконечного цикла нет;
+# переписка Claude ↔ ChatGPT идёт внутри одного запуска (см. tools/ai-chat.mjs, docs/AI-BOT.md).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'projects/*/chat/*.json'
+  workflow_dispatch:
+    inputs:
+      project:
+        description: 'Папка проекта (slug), например primer-ograzhdenie'
+        required: true
+        type: string
+      who:
+        description: 'Кто отвечает'
+        required: true
+        default: Claude
+        type: choice
+        options:
+          - Claude
+          - ChatGPT
+          - Оба
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: ai-chat
+  cancel-in-progress: false
+
+jobs:
+  reply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Настройка git
+        run: |
+          git config user.name "ИГНИС ИИ-бот"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Ответ ИИ
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          CLAUDE_MODEL: ${{ vars.CLAUDE_MODEL || 'claude-sonnet-5-5' }}
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL || 'gpt-5' }}
+          AI_TIMEOUT_MS: "300000"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+          INPUT_PROJECT: ${{ inputs.project }}
+          INPUT_WHO: ${{ inputs.who }}
+        run: node tools/ai-chat.mjs
