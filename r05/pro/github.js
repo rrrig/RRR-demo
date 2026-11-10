@@ -24,11 +24,28 @@ function b64decodeText(b64) {
 }
 const encPath = p => p.split('/').map(encodeURIComponent).join('/');
 
+// Общий предел одновременных запросов к GitHub для всего приложения (все клиенты, синхронизация,
+// чат, массовые операции): не больше 2. Место освобождается только после чтения ответа целиком.
+export const MAX_CONCURRENT = 2;
+let active = 0;
+const waiting = [];
+function acquire() {
+  if (active < MAX_CONCURRENT) { active++; return Promise.resolve(); }
+  return new Promise(resolve => waiting.push(resolve));      // место передаётся из release()
+}
+function release() { const next = waiting.shift(); if (next) next(); else active--; }
+export const inFlight = () => active;
+
 export function createClient({ owner, repo, token, branch = 'main', fetch: f = globalThis.fetch.bind(globalThis) }) {
   const base = `${API}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
   const blobCache = new Map();
 
-  async function req(method, path, body, { accept = 'application/vnd.github+json', raw = false, abs = false } = {}) {
+  async function req(method, path, body, opts = {}) {
+    await acquire();
+    try { return await send(method, path, body, opts); }
+    finally { release(); }
+  }
+  async function send(method, path, body, { accept = 'application/vnd.github+json', raw = false, abs = false } = {}) {
     let res;
     try {
       res = await f(abs ? path : base + path, {
@@ -54,7 +71,7 @@ export function createClient({ owner, repo, token, branch = 'main', fetch: f = g
       throw new GitHubError(res.status, human, data);
     }
     if (res.status === 204) return null;
-    return raw ? res.arrayBuffer() : res.json();
+    return await (raw ? res.arrayBuffer() : res.json());
   }
 
   async function head() {
