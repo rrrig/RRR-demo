@@ -40,7 +40,7 @@ def new_page(browser, p, token=True):
     ctx = browser.new_context(**device(p), locale='ru-RU', timezone_id='Europe/Moscow')
     ctx.add_init_script(INIT)
     if token:
-        ctx.add_init_script("localStorage.setItem('ignis-pro-settings', JSON.stringify({owner:'rrrig', repo:'ignis-projects', token:'tok', me:'Дмитрий'}))")
+        ctx.add_init_script("localStorage.setItem('ignis-pro-settings', JSON.stringify({owner:'rrrig', repo:'RRR', token:'tok', me:'Дмитрий'}))")
     page = ctx.new_page()
     page.clock.set_fixed_time('2026-11-09T15:00:00+03:00')
     page.on('console', lambda m: m.type in ('error', 'warning') and problems.append(f'console {m.type}: {m.text}'))
