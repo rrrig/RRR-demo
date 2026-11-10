@@ -17,10 +17,13 @@ function setup(net) {
   const handlers = {};
   const self = { location: new URL(SCOPE + 'sw.js'), registration: { scope: SCOPE }, clients: { claim: async () => {} }, skipWaiting: async () => {}, addEventListener: (t, f) => (handlers[t] = f) };
   const fetch = async req => net(typeof req === 'string' ? req : req.url);
-  vm.runInNewContext(code, { self, caches, fetch, URL, setTimeout, clearTimeout, Promise, Error });
+  // Таймаут 5 с в тесте сокращён до 20 мс.
+  const fastTimeout = (f, ms) => setTimeout(f, ms >= 5000 ? 20 : ms);
+  vm.runInNewContext(code, { self, caches, fetch, URL, setTimeout: fastTimeout, clearTimeout, Promise, Error, Symbol });
   const run = async (type, ev) => { let p; handlers[type]({ ...ev, waitUntil: x => (p = x), respondWith: x => (p = x) }); return p; };
-  const get = (url, mode = 'no-cors') => { let out = null; handlers.fetch({ request: { url, method: 'GET', mode }, respondWith: x => (out = x) }); return out; };
-  return { stores, run, get, cache: () => stores.get('ignis-pro-shell-v1') };
+  const bg = [];
+  const get = (url, mode = 'no-cors') => { let out = null; handlers.fetch({ request: { url, method: 'GET', mode }, respondWith: x => (out = x), waitUntil: x => bg.push(x) }); return out; };
+  return { stores, run, get, settle: () => Promise.all(bg), cache: () => stores.get('ignis-pro-shell-v1') };
 }
 
 test('установка сохраняет оболочку приложения; недоступный файл не мешает остальным', async () => {
@@ -63,4 +66,28 @@ test('ответ с перенаправлением не сохраняется
   const h = setup(() => Promise.resolve(resp('x', { redirected: true })));
   await h.get('https://rrrig.github.io/RRR-demo/r05', 'navigate');
   assert.equal(h.cache()?.size || 0, 0);
+});
+
+test('установка: перенаправление и ошибка сайта не сохраняются', async () => {
+  const h = setup(url => Promise.resolve(url.endsWith('/r05/') ? resp('moved', { redirected: true }) : url.endsWith('zip.js') ? resp('nf', { status: 404 }) : resp('ok')));
+  await h.run('install', {});
+  const keys = [...h.cache().keys()];
+  assert.ok(!keys.includes(SCOPE), 'страница с перенаправлением не сохранена');
+  assert.ok(!keys.some(k => k.endsWith('zip.js')), '404 не сохранён');
+  assert.ok(keys.includes(SCOPE + 'pro/app.js?v=0.10.0'));
+});
+
+test('медленная связь: показывается копия, а поздний ответ сайта обновляет её в фоне', async () => {
+  let delay = 0, body = 'old';
+  const h = setup(() => new Promise(r => setTimeout(() => r(resp(body)), delay)));
+  await h.get(SCOPE + 'pro/app.js?v=0.10.0'); await h.settle();
+  delay = 80; body = 'new';
+  assert.equal((await h.get(SCOPE + 'pro/app.js?v=0.10.0')).body, 'old', 'после таймаута — сохранённая копия');
+  await h.settle();
+  assert.equal(h.cache().get(SCOPE + 'pro/app.js?v=0.10.0').body, 'new', 'поздний ответ обновил копию');
+});
+
+test('медленная связь без копии — ждём сайт, а не ошибку', async () => {
+  const h = setup(() => new Promise(r => setTimeout(() => r(resp('slow')), 60)));
+  assert.equal((await h.get(SCOPE + 'pro/ops.js')).body, 'slow');
 });

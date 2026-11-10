@@ -69,19 +69,34 @@ async function blobText(sha) {
   C.put('blobs', sha, t).catch(() => {});
   return t;
 }
-async function blobBytes(sha) {
+// mustStore: для «Сохранить на телефон» — ошибка записи в IndexedDB считается неудачей.
+async function blobBytes(sha, mustStore = false) {
   const c = await C.get('blobs', sha).catch(() => undefined);
   if (c instanceof ArrayBuffer) return c;
   if (typeof c === 'string') return new TextEncoder().encode(c).buffer;
   if (S.offline || !S.client) throw new Error('Файл не сохранён на телефоне. Откройте его при связи или нажмите «Сохранить для работы без связи».');
   const b = await S.client.blobBytes(sha);
-  C.put('blobs', sha, b).catch(() => {});
+  const stored = await C.put('blobs', sha, b).then(() => true, () => false);
+  if (mustStore && !stored) throw new Error('Не удалось сохранить файл на телефоне (возможно, не хватает места)');
   return b;
 }
 async function pool(items, n, fn) {
   const out = new Array(items.length); let i = 0;
   await Promise.all(Array.from({ length: Math.min(n, items.length) }, async () => { while (i < items.length) { const k = i++; out[k] = await fn(items[k], k); } }));
   return out;
+}
+
+// Массовые операции (копия на телефон, ZIP): одновременно только одна, не больше 2 запросов
+// к GitHub; закрытие шторки останавливает операцию.
+let bulk = null;
+function startBulk(label) {
+  if (bulk) { toast(`Уже выполняется: ${bulk.label}. Дождитесь окончания или закройте окно.`, true); return null; }
+  bulk = { label, cancelled: false }; return bulk;
+}
+function endBulk(b) { if (bulk === b) bulk = null; }
+async function bulkPool(items, b, fn) {
+  let i = 0;
+  await Promise.all(Array.from({ length: Math.min(2, items.length) }, async () => { while (i < items.length && !b.cancelled) { const k = i++; await fn(items[k], k); } }));
 }
 
 // ---------------- Загрузка ----------------
@@ -257,7 +272,7 @@ function sheet(title, body, onSubmit, okText = 'Готово') {
   const first = $('sheetBody').querySelector('input:not([type=file]),textarea,select');
   if (first && !('ontouchstart' in window)) first.focus();
 }
-function closeSheet() { $('sheet').hidden = true; $('sheetBody').innerHTML = ''; sheetSubmit = null; }
+function closeSheet() { if (bulk) bulk.cancelled = true; $('sheet').hidden = true; $('sheetBody').innerHTML = ''; sheetSubmit = null; }
 $('sheet').addEventListener('click', e => { if (e.target.closest('[data-close]')) closeSheet(); });
 $('sheetForm').addEventListener('submit', async e => {
   e.preventDefault(); if (!sheetSubmit || $('sheetOk').disabled) return;
@@ -605,27 +620,37 @@ function overTab(p, f, el) {
 async function projectPaths(p) { return [...S.entries.keys()].filter(k => k.startsWith(`projects/${p.slug}/`)); }
 async function cacheProject(p) {
   if (S.offline) return toast('Нет связи', true);
+  const b = startBulk('сохранение проекта на телефон'); if (!b) return;
+  try {
   const paths = await projectPaths(p); let done = 0, failed = 0;
   sheet('Сохранение на телефон', `<p>Загружаю ${plural(paths.length, 'файл', 'файла', 'файлов')}…</p><div class="progress"><i id="pg" style="width:0"></i></div>`);
   await C.persist();
-  await pool(paths, 4, async path => { try { await blobBytes(S.entries.get(path).sha); } catch { failed++; } done++; const pg = $('pg'); if (pg) pg.style.width = (100 * done / paths.length) + '%'; });
+  await bulkPool(paths, b, async path => { try { await blobBytes(S.entries.get(path).sha, true); } catch { failed++; } done++; const pg = $('pg'); if (pg) pg.style.width = (100 * done / paths.length) + '%'; });
+  if (b.cancelled) return;
   $('sheetBody').innerHTML = `<p>${failed ? `Сохранено ${done - failed}, не удалось ${failed}.` : 'Готово. Проект можно открывать, скачивать и менять без связи. Изменения отправятся автоматически, когда связь появится.'}</p>`;
+  } finally { endBulk(b); }
 }
 async function zipProject(p, pj) {
+  const b = startBulk('сборка ZIP проекта'); if (!b) return;
+  try {
   const paths = await projectPaths(p);
   sheet('Архив проекта', `<p>Собираю ${plural(paths.length, 'файл', 'файла', 'файлов')}…</p><div class="progress"><i id="pg" style="width:0"></i></div>`);
   let done = 0; const missing = [];
-  const files = (await pool(paths, 4, async path => {
-    try { const b = new Uint8Array(await blobBytes(S.entries.get(path).sha)); return { name: path.slice(`projects/${p.slug}/`.length), bytes: b }; }
-    catch { missing.push(path); return null; }
+  const files = [];
+  await bulkPool(paths, b, async path => {
+    try { files.push({ name: path.slice(`projects/${p.slug}/`.length), bytes: new Uint8Array(await blobBytes(S.entries.get(path).sha)) }); }
+    catch { missing.push(path); }
     finally { done++; const pg = $('pg'); if (pg) pg.style.width = (100 * done / paths.length) + '%'; }
-  })).filter(Boolean);
+  });
+  if (b.cancelled) return;
+  files.sort((x, y) => x.name.localeCompare(y.name));
   const name = M.safeFileName((pj?.name || p.slug) + '.zip');
   const blob = makeZip(files), url = URL.createObjectURL(blob), file = new File([blob], name, { type: 'application/zip' });
   const canShare = navigator.canShare?.({ files: [file] });
   $('sheetBody').innerHTML = `<p>Архив готов: ${fmtSize(blob.size)}${missing.length ? `. Не вошли (нет связи): ${missing.length}` : ''}.</p>
     <div class="btns full">${canShare ? '<button type="button" class="btn primary" id="shareZ">Сохранить в Файлы</button>' : ''}<a class="btn ${canShare ? '' : 'primary'}" href="${url}" download="${esc(name)}">Скачать</a></div>`;
   if (canShare) $('shareZ').onclick = () => navigator.share({ files: [file], title: name }).catch(() => {});
+  } finally { endBulk(b); }
 }
 
 // ---- Весь архив: копия на телефоне и ZIP ----
@@ -640,33 +665,44 @@ function offlineSummary() {
 }
 async function cacheAll() {
   if (S.offline || !S.client) return toast('Нет связи с GitHub', true);
+  const b = startBulk('сохранение всех проектов на телефон'); if (!b) return;
+  try {
   const paths = allPaths(); let done = 0, failed = 0;
   sheet('Все проекты на телефон', `<p>Загружаю ${plural(paths.length, 'файл', 'файла', 'файлов')}. Не закрывайте приложение.</p><div class="progress"><i id="pg" style="width:0"></i></div>`);
   await C.persist();
-  // Не больше 2 запросов одновременно — бережная нагрузка на GitHub.
-  await pool(paths, 2, async path => { try { await blobBytes(S.entries.get(path).sha); } catch { failed++; } done++; const pg = $('pg'); if (pg) pg.style.width = (100 * done / paths.length) + '%'; });
+  // Не больше 2 запросов одновременно — бережная нагрузка на GitHub. Файл считается сохранённым,
+  // только если запись в память телефона подтверждена.
+  await bulkPool(paths, b, async path => { try { await blobBytes(S.entries.get(path).sha, true); } catch { failed++; } done++; const pg = $('pg'); if (pg) pg.style.width = (100 * done / paths.length) + '%'; });
+  if (b.cancelled) return;
   S.offlineAll = { at: new Date().toISOString(), failed, commit: S.head?.commit };
   await C.put('kv', 'offlineAll', S.offlineAll).catch(() => {});
   $('sheetBody').innerHTML = `<p>${failed ? `Сохранено ${done - failed}, не удалось ${failed}. Повторите при хорошей связи.` : 'Готово. Все проекты открываются и скачиваются без связи с GitHub. Изменения копятся в очереди и отправятся, когда доступ появится.'}</p>`;
+  } finally { endBulk(b); }
 }
 const ZIP_WARN = 300 * 1048576;
 async function zipAll() {
   const paths = allPaths();
   const total = paths.reduce((n, p) => n + (S.entries.get(p)?.size || 0), 0);
   if (total > ZIP_WARN && !confirm(`Архив займёт около ${fmtSize(total)}. На телефоне это может не поместиться в память. Надёжнее скачать полную копию на компьютере (GitHub Desktop). Продолжить?`)) return;
+  const b = startBulk('сборка ZIP всего архива'); if (!b) return;
+  try {
   sheet('Весь архив', `<p>Собираю ${plural(paths.length, 'файл', 'файла', 'файлов')}…</p><div class="progress"><i id="pg" style="width:0"></i></div>`);
   let done = 0; const missing = [];
-  const files = (await pool(paths, 2, async path => {
-    try { return { name: path, bytes: new Uint8Array(await blobBytes(S.entries.get(path).sha)) }; }
-    catch { missing.push(path); return null; }
+  const files = [];
+  await bulkPool(paths, b, async path => {
+    try { files.push({ name: path, bytes: new Uint8Array(await blobBytes(S.entries.get(path).sha)) }); }
+    catch { missing.push(path); }
     finally { done++; const pg = $('pg'); if (pg) pg.style.width = (100 * done / paths.length) + '%'; }
-  })).filter(Boolean);
+  });
+  if (b.cancelled) return;
+  files.sort((x, y) => x.name.localeCompare(y.name));
   const name = `IGNIS-PRO-arhiv-${new Date().toISOString().slice(0, 10)}.zip`;
   const blob = makeZip(files), url = URL.createObjectURL(blob), file = new File([blob], name, { type: 'application/zip' });
   const canShare = navigator.canShare?.({ files: [file] });
   $('sheetBody').innerHTML = `<p>Архив готов: ${fmtSize(blob.size)}, ${plural(files.length, 'файл', 'файла', 'файлов')}${missing.length ? `. Не вошли (нет связи и нет копии на телефоне): ${missing.length}` : ''}.</p>
     <div class="btns full">${canShare ? '<button type="button" class="btn primary" id="shareZ">Сохранить в Файлы</button>' : ''}<a class="btn ${canShare ? '' : 'primary'}" href="${url}" download="${esc(name)}">Скачать</a></div>`;
   if (canShare) $('shareZ').onclick = () => navigator.share({ files: [file], title: name }).catch(() => {});
+  } finally { endBulk(b); }
 }
 
 // ---- Документы ----
@@ -1092,5 +1128,6 @@ C.get('kv', 'offlineAll').then(v => { if (v) S.offlineAll = v; }).catch(() => {}
 // Запуск без связи: приложение сохраняется на телефоне (r05/sw.js) и открывается,
 // даже если сайт GitHub Pages недоступен.
 if ('serviceWorker' in navigator && location.protocol === 'https:') {
-  navigator.serviceWorker.register(new URL('../sw.js', import.meta.url), { scope: new URL('../', import.meta.url).pathname }).catch(() => {});
+  // Путь относительно страницы r05/ (index.html): r05/sw.js, область — r05/.
+  navigator.serviceWorker.register('./sw.js').catch(() => {});
 }
