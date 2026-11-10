@@ -6,7 +6,7 @@ import { buildChanges, preview } from './ops.js';
 import * as C from './cache.js';
 import { makeZip } from './zip.js';
 
-const VERSION = '0.9.0';
+const VERSION = '0.10.0';
 const SETTINGS_KEY = 'ignis-pro-settings';
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -25,13 +25,19 @@ const chip = (text, cls = '') => `<span class="chip ${cls}">${esc(text)}</span>`
 const statusCls = s => ({ 'Разрешено к выдаче': 'gold', 'На проверке': 'amber', 'Архив': '', 'Готово': 'green', 'В работе': 'amber', 'Открыта': '', 'Сдан': 'green', 'Пауза': 'amber', 'Идея': '' }[s] ?? '');
 
 // ---------------- Состояние ----------------
+// Хранилище проектов утверждено 11.11.2026: закрытый репозиторий rrrig/RRR.
+const DEFAULTS = { owner: 'rrrig', repo: 'RRR', token: '', me: 'Дмитрий' };
 const S = {
   settings: loadSettings(), client: null, head: null, entries: new Map(), projects: new Map(),
   pulls: [], pullInfo: new Map(), outbox: [], offline: false, busy: false, syncedAt: null, error: null, chatOpen: null, chat: null,
 };
 function loadSettings() {
-  try { return { owner: 'rrrig', repo: 'ignis-projects', token: '', me: 'Дмитрий', ...JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}') }; }
-  catch { return { owner: 'rrrig', repo: 'ignis-projects', token: '', me: 'Дмитрий' }; }
+  let s;
+  try { s = { ...DEFAULTS, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}') }; }
+  catch { s = { ...DEFAULTS }; }
+  // Прежнее значение по умолчанию: репозитория rrrig/ignis-projects не существует.
+  if (s.owner === 'rrrig' && s.repo === 'ignis-projects') s.repo = DEFAULTS.repo;
+  return s;
 }
 function saveSettings() { localStorage.setItem(SETTINGS_KEY, JSON.stringify(S.settings)); }
 const me = () => S.settings.me || 'Дмитрий';
@@ -622,6 +628,47 @@ async function zipProject(p, pj) {
   if (canShare) $('shareZ').onclick = () => navigator.share({ files: [file], title: name }).catch(() => {});
 }
 
+// ---- Весь архив: копия на телефоне и ZIP ----
+// Для устойчивости: если GitHub или кто-то из ИИ недоступен, все проекты остаются на телефоне,
+// а ZIP можно сохранить в «Файлы», на компьютер или внешний диск.
+const allPaths = () => [...S.entries.keys()].filter(k => k.startsWith('projects/'));
+function offlineSummary() {
+  const st = S.offlineAll;
+  const total = allPaths().reduce((n, p) => n + (S.entries.get(p)?.size || 0), 0);
+  const base = `${plural(allPaths().length, 'файл', 'файла', 'файлов')}, ${fmtSize(total)} в хранилище`;
+  return st ? `${base}; на телефон сохранено ${fmtTime(st.at)}${st.failed ? `, не удалось: ${st.failed}` : ''}` : `${base}; полная копия ещё не сохранялась`;
+}
+async function cacheAll() {
+  if (S.offline || !S.client) return toast('Нет связи с GitHub', true);
+  const paths = allPaths(); let done = 0, failed = 0;
+  sheet('Все проекты на телефон', `<p>Загружаю ${plural(paths.length, 'файл', 'файла', 'файлов')}. Не закрывайте приложение.</p><div class="progress"><i id="pg" style="width:0"></i></div>`);
+  await C.persist();
+  // Не больше 2 запросов одновременно — бережная нагрузка на GitHub.
+  await pool(paths, 2, async path => { try { await blobBytes(S.entries.get(path).sha); } catch { failed++; } done++; const pg = $('pg'); if (pg) pg.style.width = (100 * done / paths.length) + '%'; });
+  S.offlineAll = { at: new Date().toISOString(), failed, commit: S.head?.commit };
+  await C.put('kv', 'offlineAll', S.offlineAll).catch(() => {});
+  $('sheetBody').innerHTML = `<p>${failed ? `Сохранено ${done - failed}, не удалось ${failed}. Повторите при хорошей связи.` : 'Готово. Все проекты открываются и скачиваются без связи с GitHub. Изменения копятся в очереди и отправятся, когда доступ появится.'}</p>`;
+}
+const ZIP_WARN = 300 * 1048576;
+async function zipAll() {
+  const paths = allPaths();
+  const total = paths.reduce((n, p) => n + (S.entries.get(p)?.size || 0), 0);
+  if (total > ZIP_WARN && !confirm(`Архив займёт около ${fmtSize(total)}. На телефоне это может не поместиться в память. Надёжнее скачать полную копию на компьютере (GitHub Desktop). Продолжить?`)) return;
+  sheet('Весь архив', `<p>Собираю ${plural(paths.length, 'файл', 'файла', 'файлов')}…</p><div class="progress"><i id="pg" style="width:0"></i></div>`);
+  let done = 0; const missing = [];
+  const files = (await pool(paths, 2, async path => {
+    try { return { name: path, bytes: new Uint8Array(await blobBytes(S.entries.get(path).sha)) }; }
+    catch { missing.push(path); return null; }
+    finally { done++; const pg = $('pg'); if (pg) pg.style.width = (100 * done / paths.length) + '%'; }
+  })).filter(Boolean);
+  const name = `IGNIS-PRO-arhiv-${new Date().toISOString().slice(0, 10)}.zip`;
+  const blob = makeZip(files), url = URL.createObjectURL(blob), file = new File([blob], name, { type: 'application/zip' });
+  const canShare = navigator.canShare?.({ files: [file] });
+  $('sheetBody').innerHTML = `<p>Архив готов: ${fmtSize(blob.size)}, ${plural(files.length, 'файл', 'файла', 'файлов')}${missing.length ? `. Не вошли (нет связи и нет копии на телефоне): ${missing.length}` : ''}.</p>
+    <div class="btns full">${canShare ? '<button type="button" class="btn primary" id="shareZ">Сохранить в Файлы</button>' : ''}<a class="btn ${canShare ? '' : 'primary'}" href="${url}" download="${esc(name)}">Скачать</a></div>`;
+  if (canShare) $('shareZ').onclick = () => navigator.share({ files: [file], title: name }).catch(() => {});
+}
+
 // ---- Документы ----
 function nextRev(doc) {
   const nums = (doc.revisions || []).map(r => +(/(\d+)\s*$/.exec(r.rev)?.[1] || 0));
@@ -913,7 +960,7 @@ async function settingsView(v) {
     <details class="card pad" ${st.token ? '' : 'open'}><summary><b>Как получить токен (один раз)</b></summary>
       <ol class="steps">
         <li>На github.com: аватар → <b>Settings</b> → <b>Developer settings</b> → <b>Personal access tokens</b> → <b>Fine-grained tokens</b> → <b>Generate new token</b>.</li>
-        <li>Срок — 1 год. <b>Repository access</b>: <i>Only select repositories</i> → <code>${esc(st.repo || 'ignis-projects')}</code>.</li>
+        <li>Срок — 1 год. <b>Repository access</b>: <i>Only select repositories</i> → <code>${esc(st.repo || DEFAULTS.repo)}</code>.</li>
         <li><b>Permissions</b>: Contents — <i>Read and write</i>; Pull requests — <i>Read and write</i>; Actions — <i>Read-only</i>.</li>
         <li>Скопируйте токен и вставьте выше. Он хранится только на этом телефоне.</li>
       </ol>
@@ -923,6 +970,9 @@ async function settingsView(v) {
       <div class="row"><div class="grow"><div class="t">Последняя синхронизация</div><div class="s">${S.syncedAt ? fmtTime(S.syncedAt) : '—'}${S.offline ? ' · нет связи' : ''}</div></div></div>
       <div class="row"><div class="grow"><div class="t">Не отправлено изменений</div><div class="s">${S.outbox.length ? S.outbox.map(o => esc(o.label) + (o.error ? ' — ⚠ ' + esc(o.error) : '')).join('<br>') : 'нет'}</div></div>${S.outbox.length ? '<button class="btn small" id="flush">Отправить</button>' : ''}</div>
       ${S.outbox.some(o => o.error) ? '<div class="row"><div class="grow s">Изменения с ошибкой не могут быть применены (например, запись удалена кем-то другим).</div><button class="btn small danger" id="dropBad">Удалить ошибочные</button></div>' : ''}
+      <div class="row"><div class="grow"><div class="t">Копия всех проектов</div><div class="s">${esc(offlineSummary())}</div></div></div>
+      <div class="row"><div class="grow"><div class="t">Приложение без связи</div><div class="s">${'serviceWorker' in navigator ? (navigator.serviceWorker.controller ? 'сохранено на телефоне — откроется и без сайта' : 'сохраняется… откройте приложение ещё раз при связи') : 'браузер не поддерживает'}</div></div></div>
+      <div class="btns full" style="padding:10px 14px"><button class="btn" id="cacheAll">Сохранить все проекты на телефон</button><button class="btn" id="zipAll">Скачать весь архив (ZIP)</button></div>
       <div class="row"><div class="grow"><div class="t">Занято браузером</div><div class="s">${est ? fmtSize(est.usage || 0) + (est.quota ? ' из доступных ~' + fmtSize(est.quota) : '') : 'нет данных'}</div></div></div>
     </div>
     <h2>Прежний архив R08</h2>
@@ -955,6 +1005,8 @@ async function settingsView(v) {
     finally { btn.disabled = false; }
   };
   $('flush') && ($('flush').onclick = () => flushOutbox());
+  $('cacheAll').onclick = () => cacheAll();
+  $('zipAll').onclick = () => zipAll();
   $('dropBad') && ($('dropBad').onclick = async () => { for (const o of S.outbox.filter(x => x.error)) await C.del('outbox', o.seq); S.outbox = await C.all('outbox'); banner(); route(); });
 }
 
@@ -1036,3 +1088,9 @@ makeClient();
 route();
 if (S.client) load();
 document.body.dataset.ready = 'true';
+C.get('kv', 'offlineAll').then(v => { if (v) S.offlineAll = v; }).catch(() => {});
+// Запуск без связи: приложение сохраняется на телефоне (r05/sw.js) и открывается,
+// даже если сайт GitHub Pages недоступен.
+if ('serviceWorker' in navigator && location.protocol === 'https:') {
+  navigator.serviceWorker.register(new URL('../sw.js', import.meta.url), { scope: new URL('../', import.meta.url).pathname }).catch(() => {});
+}

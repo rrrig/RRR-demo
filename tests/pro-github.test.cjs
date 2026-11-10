@@ -7,7 +7,7 @@ const fake = async (opts = {}) => {
   const { templateFiles } = await import(path.join(__dirname, 'fixtures/template-seed.mjs'));
   return createFakeGitHub({ files: templateFiles(), token: 'tok', ...opts });
 };
-const client = async (g, extra = {}) => (await gh()).createClient({ owner: 'rrrig', repo: 'ignis-projects', token: 'tok', fetch: g.fetch, ...extra });
+const client = async (g, extra = {}) => (await gh()).createClient({ owner: 'rrrig', repo: 'RRR', token: 'tok', fetch: g.fetch, ...extra });
 const P = 'projects/primer-ograzhdenie/';
 
 test('чтение: head, дерево, текст и двоичный файл', async () => {
@@ -111,5 +111,5 @@ test('журнал: коммиты по пути, состояние на ком
   const old = await c.treeAt(first);
   assert.ok(!old.some(e => e.path === P + 'chat/x.json'));
   const info = await c.repoInfo();
-  assert.equal(info.full_name, 'rrrig/ignis-projects'); assert.equal(info.private, true);
+  assert.equal(info.full_name, 'rrrig/RRR'); assert.equal(info.private, true);
 });

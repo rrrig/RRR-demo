@@ -36,7 +36,7 @@ function b64(bytes) { let s = ''; for (let i = 0; i < bytes.length; i += 0x8000)
 function unb64(s) { const bin = atob(String(s).replace(/\s/g, '')); const out = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i); return out; }
 const toBytes = v => (v instanceof Uint8Array ? v : v instanceof ArrayBuffer ? new Uint8Array(v) : enc.encode(String(v)));
 
-function createFakeGitHub({ owner = 'rrrig', repo = 'ignis-projects', branch = 'main', files = {}, token = null, now = () => new Date() } = {}) {
+function createFakeGitHub({ owner = 'rrrig', repo = 'RRR', branch = 'main', files = {}, token = null, now = () => new Date() } = {}) {
   const blobs = new Map();    // sha → Uint8Array
   const trees = new Map();    // sha → Map(path → blobSha)
   const commits = new Map();  // sha → {sha, tree, parents, message, author:{name,date}}
