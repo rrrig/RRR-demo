@@ -12,7 +12,7 @@ import { createReadStream } from 'node:fs';
 import path from 'node:path';
 import {
   PROJECT_FILES, APPROVED, MAX_FILE_BYTES, FILE_KINDS, CHAT_DIR,
-  validateProject, validateChatMessage, chatFileName, validFilePath, approvalChanges,
+  validateProject, validateChatMessage, chatFileName, validFilePath, approvalChanges, fileParts,
 } from './model.js';
 
 const args = process.argv.slice(2);
@@ -98,6 +98,8 @@ async function checkRef(folder, { where, f, kind, owner }, referenced) {
   if (owner && (k === 'docs' || k === 'sources' || k === 'chat') && kind && !name.startsWith(owner + '-')) {
     add(where, `имя файла «${name}» должно начинаться с «${owner}-»`);
   }
+  const parts = fileParts(f);
+  if (parts) { await checkParts(where, f, parts, referenced); return; }
   referenced.add(f.path);
   const abs = path.join(root, f.path);
   const st = await exists(abs);
@@ -106,6 +108,31 @@ async function checkRef(folder, { where, f, kind, owner }, referenced) {
   if (typeof f.sha256 === 'string' && /^[0-9a-f]{64}$/.test(f.sha256)) {
     const h = await sha256(abs);
     if (h !== f.sha256) add(where, `sha256 «${f.path}» не совпадает (в файле ${h})`);
+  }
+}
+
+// Большой файл частями: целого файла в репозитории нет; каждая часть — отдельный файл
+// (размер и sha256 сверяются), а sha256 всех частей подряд должен совпасть с sha256 целого файла.
+async function checkParts(where, f, parts, referenced) {
+  if (await exists(path.join(root, f.path))) add(where, `«${f.path}» хранится частями — целого файла с этим именем быть не должно`);
+  const whole = createHash('sha256');
+  let complete = true;
+  for (const [i, pt] of parts.entries()) {
+    if (!pt || typeof pt.path !== 'string') { complete = false; continue; }
+    const wp = `${where}, часть ${i + 1}`;
+    referenced.add(pt.path);
+    const abs = path.join(root, pt.path);
+    const st = await exists(abs);
+    if (!st || !st.isFile()) { add(wp, `файл «${pt.path}» не найден в репозитории`); complete = false; continue; }
+    if (pt.size !== st.size) add(wp, `размер «${pt.path}»: указано ${pt.size}, на диске ${st.size} байт`);
+    const h = createHash('sha256');
+    for await (const chunk of createReadStream(abs)) { h.update(chunk); whole.update(chunk); }
+    const got = h.digest('hex');
+    if (got !== pt.sha256) add(wp, `sha256 «${pt.path}» не совпадает (в файле ${got})`);
+  }
+  if (complete && typeof f.sha256 === 'string') {
+    const got = whole.digest('hex');
+    if (got !== f.sha256) add(where, `sha256 собранного файла «${f.path}» не совпадает (по частям ${got})`);
   }
 }
 

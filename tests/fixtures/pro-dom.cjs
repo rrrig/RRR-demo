@@ -30,7 +30,7 @@ async function launch({ settings = { token: 'tok' }, fake, hash = '#/', fetchWra
   const netLog = [];
   globalThis.fetch = (url, init) => { netLog.push(url); return (fetchWrap ? fetchWrap(gh.fetch) : gh.fetch)(url, init); };
   const mods = {};
-  for (const name of ['model.js', 'github.js', 'ops.js', 'cache.js', 'zip.js']) {
+  for (const name of ['model.js', 'github.js', 'ops.js', 'cache.js', 'zip.js', 'bigfile.js']) {
     const fresh = name === 'cache.js';
     mods['./' + name] = await import(moduleURL(path.join(PRO, name), fresh));
   }

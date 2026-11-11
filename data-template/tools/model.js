@@ -12,6 +12,16 @@ export const SOURCE_TYPES = Object.freeze(['Фото', '3D-модель', 'Че�
 export const COST_GROUPS = Object.freeze(['Материалы', 'Покупное', 'Работы', 'Прочее']);
 export const AUTHORS = Object.freeze(['Дмитрий', 'Claude', 'ChatGPT']);
 export const MAX_FILE_BYTES = 50 * 1024 * 1024;
+// Большие файлы (больше MAX_FILE_BYTES) хранятся частями по PART_BYTES: <путь>.part001, .part002, …
+// В file указываются размер и sha256 целого файла и список частей (parts) с размером и sha256 каждой.
+export const PART_BYTES = 20 * 1024 * 1024;
+export const MAX_TOTAL_BYTES = 2 * 1024 * 1024 * 1024;
+export const MAX_PARTS = 200;
+export const partPath = (path, i) => `${path}.part${String(i + 1).padStart(3, '0')}`;
+const PART_RE = /\.part(\d{3})$/;
+// Путь части → путь целого файла (или null, если это не часть).
+export const partOf = path => (PART_RE.test(path || '') ? path.replace(PART_RE, '') : null);
+export const fileParts = f => (f && Array.isArray(f.parts) && f.parts.length ? f.parts : null);
 export const FILE_KINDS = Object.freeze(['docs', 'sources', 'chat', 'work']);
 
 const ID = /^[a-z]-[a-z0-9]{6,40}$/;
@@ -95,8 +105,28 @@ function checker(file) {
     if (!isObj(f)) return err(where, 'file должен быть объектом');
     text(f, 'path', where, { max: 300 });
     text(f, 'name', where, { max: 300 });
-    num(f, 'size', where, { max: MAX_FILE_BYTES * 2 });
-    if (f.sha256 !== undefined && !/^[0-9a-f]{64}$/.test(f.sha256)) err(where, 'sha256 должен быть 64 hex-символа');
+    const HEX = /^[0-9a-f]{64}$/;
+    if (f.parts === undefined) {
+      num(f, 'size', where, { max: MAX_FILE_BYTES });
+      if (f.sha256 !== undefined && !HEX.test(f.sha256)) err(where, 'sha256 должен быть 64 hex-символа');
+      return;
+    }
+    // Файл из частей
+    num(f, 'size', where, { min: MAX_FILE_BYTES + 1, max: MAX_TOTAL_BYTES });
+    if (!HEX.test(f.sha256 || '')) err(where, 'у файла из частей обязателен sha256 целого файла (64 hex-символа)');
+    if (!Array.isArray(f.parts) || f.parts.length < 2 || f.parts.length > MAX_PARTS) return err(where, `parts — список из 2…${MAX_PARTS} частей`);
+    let sum = 0;
+    f.parts.forEach((pt, i) => {
+      const wp = `${where}, часть ${i + 1}`;
+      if (!isObj(pt)) return err(wp, 'ожидается объект');
+      if (typeof f.path === 'string' && pt.path !== partPath(f.path, i)) err(wp, `путь должен быть «${partPath(f.path, i)}»`);
+      const last = i === f.parts.length - 1;
+      if (last) num(pt, 'size', wp, { min: 1, max: PART_BYTES });
+      else if (pt.size !== PART_BYTES) err(wp, `размер каждой части, кроме последней, — ${PART_BYTES} байт`);
+      if (!HEX.test(pt.sha256 || '')) err(wp, 'sha256 части обязателен (64 hex-символа)');
+      if (typeof pt.size === 'number') sum += pt.size;
+    });
+    if (typeof f.size === 'number' && sum !== f.size) err(where, `сумма частей ${sum} байт не равна size ${f.size}`);
   };
   const arr = (o, k, where) => { if (!Array.isArray(o[k])) { err(where, `«${k}» должно быть списком`); return []; } return o[k]; };
   return { errors, err, isObj, text, oneOf, date, id, num, fileRef, arr };
