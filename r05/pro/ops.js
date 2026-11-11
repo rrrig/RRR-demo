@@ -1,7 +1,7 @@
 // Изменения пользователя в виде данных («операций»).
 // Одна и та же операция применяется сразу (при связи) или позже из очереди (без связи)
 // к самой свежей версии проекта — поэтому чужие изменения не затираются.
-import { PROJECT_FILES, APPROVED, today, validateFile, validateChatMessage, chatFileName, CHAT_DIR, validFilePath, wholeOf } from './model.js';
+import { PROJECT_FILES, APPROVED, today, validateFile, validateChatMessage, chatFileName, CHAT_DIR, validFilePath, wholeOf, projectLinkErrors } from './model.js';
 
 const clone = x => (x === undefined ? undefined : JSON.parse(JSON.stringify(x)));
 // Слияние записи: поля со значением null удаляются (так форма сообщает «поле очищено»),
@@ -78,6 +78,18 @@ function findDoc(f, id) {
 
 // Построить список изменений файлов репозитория для одной операции.
 // read(path) → текст или undefined; blobSha(key) → sha уже загруженного файла.
+async function checkLinks(slug, pj, read, tree) {
+  if (!pj || (!pj.parent && !(pj.related || []).length)) return;      // связей нет — нечего проверять
+  const list = [{ folder: slug, project: pj }];
+  for (const path of tree.keys()) {
+    const m = /^projects\/([^/]+)\/project\.json$/.exec(path);
+    if (!m || m[1] === slug) continue;
+    try { list.push({ folder: m[1], project: JSON.parse(await read(path)) }); } catch { /* повреждённый project.json другого проекта — не связь */ }
+  }
+  const mine = projectLinkErrors(list).filter(e => e.startsWith(`projects/${slug}:`));
+  if (mine.length) throw new Error('Связь проектов не сохранена: ' + mine.map(e => e.slice(`projects/${slug}: `.length)).join('; ') + '. Обновите список проектов и выберите снова.');
+}
+
 // Все пути, которыми сейчас представлен файл L в дереве: сам L, его части L.partNNN и манифест L.parts.json.
 function representation(tree, L) {
   const out = [];
@@ -132,6 +144,10 @@ export async function buildChanges(slug, op, read, blobSha, tree = null) {
       if (errs.length) throw new Error(errs.join('\n'));
       changes.push({ path: dir + name, text: text(name) });
     }
+    // Связи проектов проверяются по свежему дереву хранилища, прочитанному прямо перед записью
+    // (mutate повторяет сборку при конфликте; очередь с телефона идёт тем же путём): цель parent/related
+    // существует, вложенность без циклов. Так одновременная правка другого устройства не даст записать цикл.
+    if (changed.includes('project.json') && tree) await checkLinks(slug, files['project.json'], read, tree);
   }
   for (const u of op.uploads || []) changes.push({ path: u.path, sha: await blobSha(u) });
   return changes;

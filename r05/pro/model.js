@@ -157,6 +157,14 @@ export function validateFile(name, data, folder = '') {
       c.text(data, 'description', '', { required: false, max: 20000 });
       c.date(data, 'created', ''); c.date(data, 'updated', '');
       c.text(data, 'author', '', { required: false, max: 100 });
+      // Связи: parent — проект, в который входит этот (подпроект); related — связанные проекты.
+      if (data.parent !== undefined && (typeof data.parent !== 'string' || !ID.test(data.parent) || data.parent[0] !== 'p')) c.err('', 'parent — id проекта вида p-xxxxxx');
+      else if (data.parent !== undefined && data.parent === data.id) c.err('', 'проект не может входить сам в себя');
+      if (data.related !== undefined) {
+        if (!Array.isArray(data.related) || data.related.length > 50) c.err('', 'related — список id проектов (не больше 50)');
+        else data.related.forEach((r, i) => { if (typeof r !== 'string' || !ID.test(r) || r[0] !== 'p') c.err('', `related[${i + 1}] — id проекта вида p-xxxxxx`); else if (r === data.id) c.err('', 'проект не может быть связан сам с собой'); });
+        if (Array.isArray(data.related) && new Set(data.related).size !== data.related.length) c.err('', 'related: повтор проекта');
+      }
       break;
     case 'documents.json':
       c.arr(data, 'documents', '').forEach((d, i) => {
@@ -316,4 +324,22 @@ export function validateManifest(data, path) {
   if (!Array.isArray(data.parts)) c.err('', 'нет списка частей parts');
   else c.fileRef(data, '');
   return c.errors;
+}
+
+// Проверка связей между проектами: projects — [{ folder, project }] (содержимое project.json).
+// parent и related должны ссылаться на существующие проекты; цепочка parent — без циклов.
+export function projectLinkErrors(projects) {
+  const byId = new Map(projects.filter(x => x.project && typeof x.project.id === 'string').map(x => [x.project.id, x]));
+  const errors = [];
+  for (const { folder, project: pj } of projects) {
+    if (!pj) continue;
+    if (pj.parent && !byId.has(pj.parent)) errors.push(`projects/${folder}: parent ${pj.parent} — нет такого проекта`);
+    for (const r of Array.isArray(pj.related) ? pj.related : []) if (!byId.has(r)) errors.push(`projects/${folder}: related ${r} — нет такого проекта`);
+    const seen = new Set([pj.id]);
+    for (let cur = pj.parent && byId.get(pj.parent)?.project; cur; cur = cur.parent && byId.get(cur.parent)?.project) {
+      if (seen.has(cur.id)) { errors.push(`projects/${folder}: цикл во вложенности проектов`); break; }
+      seen.add(cur.id);
+    }
+  }
+  return errors;
 }

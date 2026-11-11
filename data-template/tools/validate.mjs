@@ -13,7 +13,7 @@ import path from 'node:path';
 import {
   PROJECT_FILES, APPROVED, MAX_FILE_BYTES, FILE_KINDS, CHAT_DIR,
   validateProject, validateChatMessage, chatFileName, validFilePath, approvalChanges, fileParts,
-  manifestPath, manifestOf, partOf, validateManifest, sameManifest,
+  manifestPath, manifestOf, partOf, validateManifest, sameManifest, projectLinkErrors,
 } from './model.js';
 
 const args = process.argv.slice(2);
@@ -245,6 +245,7 @@ async function main() {
 
   const entries = (await listDir(projectsDir)).sort((a, b) => a.name.localeCompare(b.name));
   const seenIds = new Map();
+  const allProjects = [];
   let count = 0;
 
   for (const e of entries) {
@@ -271,6 +272,7 @@ async function main() {
       if (seenIds.has(p.id)) add(where, `id проекта ${p.id} уже используется в projects/${seenIds.get(p.id)}`);
       else seenIds.set(p.id, folder);
     }
+    if (ok(p)) allProjects.push({ folder, project: p });
 
     const referenced = new Set();
     for (const ref of projectFileRefs(files)) await checkRef(folder, { ...ref, where: `${where} › ${ref.where}` }, referenced);
@@ -288,6 +290,9 @@ async function main() {
       await checkAppendOnly(folder, where);
     }
   }
+
+  // Связи между проектами (parent, related): ссылки на существующие проекты, без циклов.
+  for (const m of projectLinkErrors(allProjects)) errors.push(m);
 
   // Проекты, удалённые относительно base
   if (baseDir) {
