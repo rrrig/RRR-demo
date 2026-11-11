@@ -76,7 +76,13 @@ test('хранилище: split → validate; манифест обязател�
   fs.unlinkSync(man); assert.match(r.runFail('tools/validate.mjs').out, /нет манифеста/);
   const m2 = JSON.parse(manText); m2.name = 'другое.bin'; fs.writeFileSync(man, JSON.stringify(m2));
   assert.match(r.runFail('tools/validate.mjs').out, /не совпадает с манифестом/);
+  const m3 = JSON.parse(manText); m3.schema = 999; fs.writeFileSync(man, JSON.stringify(m3));
+  assert.match(r.runFail('tools/validate.mjs').out, /манифест .*schema должна быть 1/);
+  delete m3.schema; fs.writeFileSync(man, JSON.stringify(m3));
+  assert.match(r.runFail('tools/validate.mjs').out, /манифест .*schema должна быть 1/);
+  fs.writeFileSync(man, '{не json'); assert.match(r.runFail('tools/validate.mjs').out, /манифест .*ошибка JSON/);
   fs.writeFileSync(man, manText);
+  assert.match(r.run('tools/validate.mjs'), /Проверка пройдена/);
   fs.writeFileSync(path.join(r.tmp, rp), 'x'); assert.match(r.runFail('tools/validate.mjs').out, /хранится частями/); fs.unlinkSync(path.join(r.tmp, rp));
   const p2 = path.join(r.tmp, rp + '.part002'); const b = fs.readFileSync(p2); b[0] ^= 1; fs.writeFileSync(p2, b);
   assert.match(r.runFail('tools/validate.mjs').out, /часть 2: sha256/);

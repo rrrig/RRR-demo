@@ -107,7 +107,13 @@ async function checkRef(folder, { where, f, kind, owner }, referenced) {
     const m = await readJson(path.join(root, mp));
     if (m === undefined) add(where, `нет манифеста «${mp}» (создаётся tools/split-file.mjs)`);
     else if (m instanceof Error) add(where, `манифест «${mp}»: ${m.message}`);
-    else if (!sameManifest(m, f)) add(where, `запись file не совпадает с манифестом «${mp}»`);
+    else {
+      // Сначала сам манифест (schema, path, части) — как его проверяют приложение и join-file.mjs,
+      // затем совпадение с записью file.
+      const errs = validateManifest(m, f.path);
+      if (errs.length) for (const x of errs) add(where, `манифест «${mp}»: ${x}`);
+      else if (!sameManifest(m, f)) add(where, `запись file не совпадает с манифестом «${mp}»`);
+    }
     await checkParts(where, f, parts, referenced);
     return;
   }
