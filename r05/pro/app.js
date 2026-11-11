@@ -7,7 +7,7 @@ import * as C from './cache.js';
 import { makeZip } from './zip.js';
 import { splitBlob, assembleParts, groupParts, needsParts } from './bigfile.js';
 
-const VERSION = '0.12.0';
+const VERSION = '0.13.0';
 const SETTINGS_KEY = 'ignis-pro-settings';
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -365,7 +365,11 @@ function linkFields(pj) {
   const others = projList().filter(x => x.pj.id !== pj?.id).sort(byName);
   const banned = pj ? withDescendants(pj.id) : new Set();
   return field('Входит в проект', `<select name="parent"><option value="">— самостоятельный проект —</option>${others.filter(x => !banned.has(x.pj.id)).map(x => `<option value="${esc(x.pj.id)}"${pj?.parent === x.pj.id ? ' selected' : ''}>${esc(x.pj.name)}</option>`).join('')}</select>`)
-    + (others.length ? field('Связанные проекты', `<div class="checks">${others.map(x => `<label class="check"><input type="checkbox" name="related" value="${esc(x.pj.id)}"${(pj?.related || []).includes(x.pj.id) ? ' checked' : ''}><span>${esc(x.pj.name)}</span></label>`).join('')}</div>`) : '');
+    + (others.length ? `<div class="field"><span>Связанные проекты</span><div class="checks">${others.map(x => {
+      // Связь, заданная в другом проекте, видна отмеченной; снять её можно только там.
+      const theirs = pj && (x.pj.related || []).includes(pj.id) && !(pj.related || []).includes(x.pj.id);
+      return `<label class="check"><input type="checkbox" name="related" value="${esc(x.pj.id)}"${(pj?.related || []).includes(x.pj.id) || theirs ? ' checked' : ''}${theirs ? ' disabled' : ''}><span>${esc(x.pj.name)}${theirs ? '<small>связь указана в том проекте</small>' : ''}</span></label>`;
+    }).join('')}</div></div>` : '');
 }
 
 function projectsView(v) {
@@ -399,7 +403,7 @@ function projectsView(v) {
       const pj = f['project.json'], open = (f['tasks.json']?.tasks || []).filter(t => t.status !== 'Готово').length;
       const total = f['cost.json']?.items ? M.costTotals(f['cost.json']).total : 0, prs = prCount(p.slug);
       const nKids = list.filter(x => x.f['project.json'].parent === pj.id).length;
-      return `<a class="row${depth ? ' sub' : ''}" href="#/p/${encodeURIComponent(p.slug)}"${depth ? ` style="padding-left:${14 + 18 * Math.min(depth, 4)}px"` : ''}>
+      return `<a class="row${depth ? ' sub' : ''}" data-st="${esc(pj.status)}" href="#/p/${encodeURIComponent(p.slug)}"${depth ? ` style="padding-left:${14 + 18 * Math.min(depth, 4)}px"` : ''}>
         <div class="grow"><div class="t">${depth ? '<span class="muted">↳ </span>' : ''}${esc(pj.name)}</div>
         <div class="s">${[pj.customer ? esc(pj.customer) : '', plural((f['documents.json']?.documents || []).length, 'документ', 'документа', 'документов'), open ? plural(open, 'открытая задача', 'открытые задачи', 'открытых задач') : 'нет открытых задач', total ? M.rub(total) : ''].filter(Boolean).join(' · ')}</div>
         <div class="chips">${chip(pj.status, statusCls(pj.status))}${nKids ? chip(plural(nKids, 'подпроект', 'подпроекта', 'подпроектов')) : ''}${prs ? chip(plural(prs, 'предложение', 'предложения', 'предложений'), 'amber') : ''}${p.errors.length ? chip('ошибки в данных', 'red') : ''}${pendingFor(p.slug).length ? chip('⏳ ждёт отправки', 'amber') : ''}</div></div>
@@ -675,7 +679,14 @@ function overTab(p, f, el) {
   const openTasks = tasks.filter(x => x.status !== 'Готово').length, enc = encodeURIComponent(p.slug);
   el.innerHTML = `
     ${p.errors.length ? `<div class="errors"><b>Ошибки в данных проекта</b> — исправьте или попросите ИИ:<ul>${p.errors.slice(0, 12).map(e => `<li>${esc(e)}</li>`).join('')}</ul></div>` : ''}
-    ${pj && !(pj instanceof Error) ? `<div class="hero"><h1>${esc(pj.name)}</h1><div class="muted">${esc(pj.customer || 'Заказчик не указан')} · создан ${fmtDate(pj.created)} · изменён ${fmtDate(pj.updated)}</div><div class="chips">${chip(pj.status, pj.status === 'Сдан' ? 'gold' : '')}</div></div>` : ''}
+    ${pj && !(pj instanceof Error) ? `<div class="stamp">
+      <div class="stamp-name"><h1>${esc(pj.name)}</h1><span class="mark" aria-hidden="true"></span></div>
+      <div class="stamp-cells">
+        <div><span>Заказчик</span><b>${esc(pj.customer || 'не указан')}</b></div>
+        <div><span>Статус</span><b>${chip(pj.status, statusCls(pj.status))}</b></div>
+        <div><span>Создан</span><b>${fmtDate(pj.created)}</b></div>
+        <div><span>Изменён</span><b>${fmtDate(pj.updated)}</b></div>
+      </div></div>` : ''}
     <div class="tiles">
       <a class="tile" href="#/p/${enc}/docs"><div class="v">${docs.length}</div><div class="l">${pluralWord(docs.length, 'документ', 'документа', 'документов')} · к выдаче ${approved}</div></a>
       <a class="tile" href="#/p/${enc}/tasks"><div class="v">${openTasks}</div><div class="l">${pluralWord(openTasks, 'открытая задача', 'открытые задачи', 'открытых задач')} из ${tasks.length}</div></a>
