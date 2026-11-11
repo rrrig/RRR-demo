@@ -7,7 +7,7 @@ import * as C from './cache.js';
 import { makeZip } from './zip.js';
 import { splitBlob, assembleParts, groupParts, needsParts } from './bigfile.js';
 
-const VERSION = '0.13.0';
+const VERSION = '0.14.0';
 const SETTINGS_KEY = 'ignis-pro-settings';
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -27,7 +27,7 @@ const statusCls = s => ({ 'Разрешено к выдаче': 'gold', 'На п
 
 // ---------------- Состояние ----------------
 // Хранилище проектов утверждено 11.11.2026: закрытый репозиторий rrrig/RRR.
-const DEFAULTS = { owner: 'rrrig', repo: 'RRR', token: '', me: 'Дмитрий' };
+const DEFAULTS = { owner: 'rrrig', repo: 'RRR', token: '', me: 'Дмитрий', claudeUrl: '', chatgptUrl: '' };
 const S = {
   settings: loadSettings(), client: null, head: null, entries: new Map(), projects: new Map(),
   pulls: [], pullInfo: new Map(), outbox: [], offline: false, busy: false, syncedAt: null, error: null, chatOpen: null, chat: null,
@@ -470,7 +470,7 @@ function chatTab(p, f, el) {
   el.innerHTML = `<div class="chat" id="chatList"></div>
     <form class="composer" id="composer">
       <div id="replyBox" class="replybox" hidden></div>
-      <div class="quick"><button type="button" data-at="@Claude ">@Claude</button><button type="button" data-at="@ChatGPT ">@ChatGPT</button><button type="button" data-at="@все ">@все</button><button type="button" id="manual">Позвать вручную</button></div>
+      <div class="quick"><a class="call claude" id="callClaude" href="${esc(callUrl('claude', p, pj))}" target="_blank" rel="noopener">▶ Claude</a><a class="call gpt" id="callGpt" href="${esc(callUrl('chatgpt', p, pj))}" target="_blank" rel="noopener">▶ ChatGPT</a><button type="button" data-at="@Claude ">@Claude</button><button type="button" data-at="@ChatGPT ">@ChatGPT</button><button type="button" data-at="@все ">@все</button><button type="button" id="manual">Задание</button></div>
       <div class="line">
         <label class="clip" aria-label="Приложить файлы">📎<input type="file" id="attach" multiple hidden></label>
         <textarea id="msg" rows="1" placeholder="Сообщение…" enterkeyhint="enter"></textarea>
@@ -533,6 +533,7 @@ function chatTab(p, f, el) {
   $('attach').onchange = () => { attachments.push(...$('attach').files); $('attach').value = ''; showAttachments(); };
   $('attList').onclick = e => { const x = e.target.closest('[data-unattach]'); if (x) { attachments.splice(+x.dataset.unattach, 1); showAttachments(); } };
   $('manual').onclick = () => manualHelp(p, pj);
+  for (const [id, who] of [['callClaude', 'claude'], ['callGpt', 'chatgpt']]) $(id).onclick = () => callAi(who, p, pj);
   composer.onsubmit = async e => {
     e.preventDefault();
     const text = ta.value.trim(); if ((!text && !attachments.length) || $('sendBtn').disabled) return;
@@ -583,9 +584,35 @@ function keyboardOffset() {
   document.body.style.setProperty('--kb', kb + 'px');
 }
 window.visualViewport?.addEventListener('resize', () => { if (document.body.classList.contains('typing')) keyboardOffset(); });
-function manualHelp(p, pj) {
+// ---- Позвать ИИ ----
+// Бота нет (правила GitHub), поэтому кнопка открывает приложение Claude или ChatGPT и кладёт
+// в буфер готовую команду: в сохранённом рабочем чате — короткое «чат …», в новом чате — полное
+// задание (ИИ там не знает контекста). Ссылка открывается сразу по нажатию, без ожидания буфера.
+const AI = {
+  claude: { name: 'Claude', key: 'claudeUrl', fresh: q => 'https://claude.ai/new?q=' + encodeURIComponent(q), ok: /^https:\/\/claude\.ai\// },
+  chatgpt: { name: 'ChatGPT', key: 'chatgptUrl', fresh: q => 'https://chatgpt.com/?q=' + encodeURIComponent(q), ok: /^https:\/\/(chatgpt\.com|chat\.openai\.com)\// }
+};
+function callText(p, pj, full) {
+  const name = pj?.name || p.slug;
+  return full ? taskPrompt(p, pj) : `чат — проект «${name}» (projects/${p.slug}/): прочитай новые сообщения и ответь в чате приложения.`;
+}
+function callUrl(who, p, pj) {
+  const a = AI[who], saved = S.settings[a.key];
+  return saved && a.ok.test(saved) ? saved : a.fresh(callText(p, pj, true));
+}
+function callAi(who, p, pj) {
+  const a = AI[who], saved = S.settings[a.key] && a.ok.test(S.settings[a.key]);
+  const text = callText(p, pj, !saved);
+  navigator.clipboard?.writeText(text).then(
+    () => toast(saved ? `Команда скопирована — вставьте в чат ${a.name} и отправьте` : `Задание скопировано — отправьте его в ${a.name}`),
+    () => toast(`Откройте ${a.name} и напишите: чат`, true));
+}
+function taskPrompt(p, pj) {
   const repo = `${S.settings.owner}/${S.settings.repo}`;
-  const prompt = `Работаем над проектом «${pj?.name || p.slug}» в GitHub-репозитории ${repo}, папка projects/${p.slug}/. Прочитай AGENTS.md и последние сообщения в projects/${p.slug}/chat/. Ответь в чат проекта по правилам AGENTS.md (новый файл сообщения), а изменения файлов проекта оформи как предложение (pull request).`;
+  return `Работаем над проектом «${pj?.name || p.slug}» в GitHub-репозитории ${repo}, папка projects/${p.slug}/. Прочитай AGENTS.md и последние сообщения в projects/${p.slug}/chat/. Ответь в чат проекта по правилам AGENTS.md (новый файл сообщения), а изменения файлов проекта оформи как предложение (pull request).`;
+}
+function manualHelp(p, pj) {
+  const prompt = taskPrompt(p, pj);
   sheet('Позвать ИИ вручную', `<p class="muted">Если автоматический ответ не настроен или нет ответа — скопируйте задание и вставьте его в приложение Claude или ChatGPT. Оба ИИ работают с одним и тем же репозиторием и видят сообщения друг друга.</p>
     <pre class="prompt" id="prompt">${esc(prompt)}</pre>
     <div class="btns full"><button type="button" class="btn primary" id="copyPrompt">Скопировать</button></div>
@@ -1106,6 +1133,9 @@ async function settingsView(v) {
       <div class="two">${input('owner', 'Владелец', st.owner, 'autocapitalize="off" autocorrect="off"')}${input('repo', 'Репозиторий', st.repo, 'autocapitalize="off" autocorrect="off"')}</div>
       ${field('Токен GitHub', `<input name="token" type="password" value="${esc(st.token)}" autocomplete="off" placeholder="github_pat_…">`)}
       ${input('me', 'Ваше имя в чате', st.me)}
+      ${input('claudeUrl', 'Рабочий чат Claude (ссылка)', st.claudeUrl, 'type="url" inputmode="url" autocapitalize="off" autocorrect="off" placeholder="https://claude.ai/chat/…"')}
+      ${input('chatgptUrl', 'Рабочий чат ChatGPT (ссылка)', st.chatgptUrl, 'type="url" inputmode="url" autocapitalize="off" autocorrect="off" placeholder="https://chatgpt.com/c/…"')}
+      <p class="note" style="margin:-4px 0 10px">Кнопки «Позвать» в чате проекта открывают эти чаты. Ссылка: в Claude или ChatGPT откройте рабочий чат → «Поделиться» / ⋯ → «Копировать ссылку». Пусто — откроется новый чат с готовым заданием.</p>
       <div class="btns full"><button class="btn primary">Сохранить и проверить</button></div>
       <div id="connState" class="muted" style="margin-top:10px">${S.connMsg || ''}</div>
     </form>
@@ -1138,9 +1168,13 @@ async function settingsView(v) {
     const fd = Object.fromEntries(new FormData($('conn')));
     const first = !S.settings.token;
     if (!fd.owner.trim() || !fd.repo.trim()) { $('connState').innerHTML = '<span class="bad">Укажите владельца и репозиторий.</span>'; return; }
+    for (const [k, a] of [['claudeUrl', AI.claude], ['chatgptUrl', AI.chatgpt]]) {
+      fd[k] = (fd[k] || '').trim();
+      if (fd[k] && !a.ok.test(fd[k])) { $('connState').innerHTML = `<span class="bad">Ссылка на чат ${a.name} должна начинаться с ${a.name === 'Claude' ? 'https://claude.ai/' : 'https://chatgpt.com/'}</span>`; return; }
+    }
     if (!fd.token.trim()) { $('connState').innerHTML = '<span class="bad">Вставьте токен GitHub — без него приложение не видит проекты.</span>'; return; }
     const changed = fd.owner.trim() !== S.settings.owner || fd.repo.trim() !== S.settings.repo;
-    Object.assign(S.settings, { owner: fd.owner.trim(), repo: fd.repo.trim(), token: fd.token.trim(), me: fd.me.trim() || 'Дмитрий' });
+    Object.assign(S.settings, { owner: fd.owner.trim(), repo: fd.repo.trim(), token: fd.token.trim(), me: fd.me.trim() || 'Дмитрий', claudeUrl: fd.claudeUrl, chatgptUrl: fd.chatgptUrl });
     saveSettings(); makeClient();
     if (changed) { S.head = null; S.entries = new Map(); S.projects = new Map(); S.pulls = []; S.pullInfo.clear(); await C.del('kv', 'state').catch(() => {}); }
     const out = $('connState'); out.textContent = 'Проверяю…';
