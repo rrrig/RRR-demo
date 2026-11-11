@@ -7,7 +7,7 @@ import * as C from './cache.js';
 import { makeZip } from './zip.js';
 import { splitBlob, assembleParts, groupParts, needsParts } from './bigfile.js';
 
-const VERSION = '0.11.0';
+const VERSION = '0.12.0';
 const SETTINGS_KEY = 'ignis-pro-settings';
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -346,6 +346,28 @@ window.addEventListener('online', () => load());
 document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && S.client) load(); });
 
 // ---------------- Список проектов ----------------
+// ---- Связи проектов: parent (входит в проект) и related (связанные) ----
+const projList = () => [...S.projects.values()].map(p => ({ p, pj: viewFiles(p)['project.json'] })).filter(x => x.pj && !(x.pj instanceof Error));
+const projById = id => projList().find(x => x.pj.id === id) || null;
+const byName = (a, b) => a.pj.name.localeCompare(b.pj.name, 'ru');
+// id проекта и всех его подпроектов (на любую глубину) — их нельзя выбрать родителем.
+function withDescendants(id) {
+  const out = new Set([id]); let grew = true;
+  while (grew) { grew = false; for (const x of projList()) if (x.pj.parent && out.has(x.pj.parent) && !out.has(x.pj.id)) { out.add(x.pj.id); grew = true; } }
+  return out;
+}
+const childrenOf = id => projList().filter(x => x.pj.parent === id).sort(byName);
+// Связанные в обе стороны: указанные в этом проекте и проекты, указавшие этот.
+const relatedOf = pj => projList().filter(x => x.pj.id !== pj.id && ((pj.related || []).includes(x.pj.id) || (x.pj.related || []).includes(pj.id))).sort(byName);
+const projLink = x => `<a class="row" href="#/p/${encodeURIComponent(x.p.slug)}"><div class="grow"><div class="t">${esc(x.pj.name)}</div><div class="chips">${chip(x.pj.status, statusCls(x.pj.status))}</div></div><span class="chev">›</span></a>`;
+// Поля формы проекта: «Входит в проект» и «Связанные проекты».
+function linkFields(pj) {
+  const others = projList().filter(x => x.pj.id !== pj?.id).sort(byName);
+  const banned = pj ? withDescendants(pj.id) : new Set();
+  return field('Входит в проект', `<select name="parent"><option value="">— самостоятельный проект —</option>${others.filter(x => !banned.has(x.pj.id)).map(x => `<option value="${esc(x.pj.id)}"${pj?.parent === x.pj.id ? ' selected' : ''}>${esc(x.pj.name)}</option>`).join('')}</select>`)
+    + (others.length ? field('Связанные проекты', `<div class="checks">${others.map(x => `<label class="check"><input type="checkbox" name="related" value="${esc(x.pj.id)}"${(pj?.related || []).includes(x.pj.id) ? ' checked' : ''}><span>${esc(x.pj.name)}</span></label>`).join('')}</div>`) : '');
+}
+
 function projectsView(v) {
   setBar('Проекты', S.settings.repo ? `${S.settings.owner}/${S.settings.repo}` : '');
   const q0 = sessionStorage.getItem('q') || '';
@@ -362,13 +384,25 @@ function projectsView(v) {
     const broken = [...S.projects.values()].filter(p => !p.files['project.json'] || p.files['project.json'] instanceof Error);
     const pendingNew = S.outbox.filter(o => o.type === 'create');
     const prCount = slug => S.pulls.filter(pr => S.pullInfo.get(pr.number)?.slugs.includes(slug)).length;
-    const rows = list.map(({ p, f }) => {
+    // Без поиска — деревом: подпроекты под своим проектом (с отступом); при поиске — плоским списком.
+    let ordered = list.map(x => ({ ...x, depth: 0 }));
+    if (!q) {
+      const ids = new Set(list.map(x => x.f['project.json'].id)), kids = new Map();
+      for (const x of list) { const par = x.f['project.json'].parent; if (par && ids.has(par)) { if (!kids.has(par)) kids.set(par, []); kids.get(par).push(x); } }
+      const out = [], seen = new Set();
+      const walk = (x, depth) => { const id = x.f['project.json'].id; if (seen.has(id)) return; seen.add(id); out.push({ ...x, depth }); for (const k of kids.get(id) || []) walk(k, depth + 1); };
+      for (const x of list) { const par = x.f['project.json'].parent; if (!par || !ids.has(par)) walk(x, 0); }
+      for (const x of list) walk(x, 0);   // на случай цикла в данных — показать всё
+      ordered = out;
+    }
+    const rows = ordered.map(({ p, f, depth }) => {
       const pj = f['project.json'], open = (f['tasks.json']?.tasks || []).filter(t => t.status !== 'Готово').length;
       const total = f['cost.json']?.items ? M.costTotals(f['cost.json']).total : 0, prs = prCount(p.slug);
-      return `<a class="row" href="#/p/${encodeURIComponent(p.slug)}">
-        <div class="grow"><div class="t">${esc(pj.name)}</div>
+      const nKids = list.filter(x => x.f['project.json'].parent === pj.id).length;
+      return `<a class="row${depth ? ' sub' : ''}" href="#/p/${encodeURIComponent(p.slug)}"${depth ? ` style="padding-left:${14 + 18 * Math.min(depth, 4)}px"` : ''}>
+        <div class="grow"><div class="t">${depth ? '<span class="muted">↳ </span>' : ''}${esc(pj.name)}</div>
         <div class="s">${[pj.customer ? esc(pj.customer) : '', plural((f['documents.json']?.documents || []).length, 'документ', 'документа', 'документов'), open ? plural(open, 'открытая задача', 'открытые задачи', 'открытых задач') : 'нет открытых задач', total ? M.rub(total) : ''].filter(Boolean).join(' · ')}</div>
-        <div class="chips">${chip(pj.status, statusCls(pj.status))}${prs ? chip(plural(prs, 'предложение', 'предложения', 'предложений'), 'amber') : ''}${p.errors.length ? chip('ошибки в данных', 'red') : ''}${pendingFor(p.slug).length ? chip('⏳ ждёт отправки', 'amber') : ''}</div></div>
+        <div class="chips">${chip(pj.status, statusCls(pj.status))}${nKids ? chip(plural(nKids, 'подпроект', 'подпроекта', 'подпроектов')) : ''}${prs ? chip(plural(prs, 'предложение', 'предложения', 'предложений'), 'amber') : ''}${p.errors.length ? chip('ошибки в данных', 'red') : ''}${pendingFor(p.slug).length ? chip('⏳ ждёт отправки', 'amber') : ''}</div></div>
         <span class="chev">›</span></a>`;
     }).join('') + pendingNew.map(o => `<div class="row"><div class="grow"><div class="t">${esc(o.files['project.json'].name)}</div><div class="chips">${chip(o.error ? '⚠ ' + o.error : '⏳ создаётся — отправится при связи', o.error ? 'red' : 'amber')}</div></div></div>`).join('');
     $('plist').innerHTML = `
@@ -378,14 +412,16 @@ function projectsView(v) {
   renderList();
   if ($('q')) $('q').oninput = e => { sessionStorage.setItem('q', e.target.value); renderList(); };
   $('newProject').onclick = () => sheet('Новый проект',
-    input('name', 'Название', '', 'required placeholder="Например, Звезда на ёлку 6 м"') + input('customer', 'Заказчик') + area('description', 'Описание и исходные данные', '', 'placeholder="Размеры, материалы, сроки, требования…"'),
-    async val => {
+    input('name', 'Название', '', 'required placeholder="Например, Звезда на ёлку 6 м"') + input('customer', 'Заказчик') + area('description', 'Описание и исходные данные', '', 'placeholder="Размеры, материалы, сроки, требования…"') + linkFields(null),
+    async (val, form) => {
       if (!val.name) throw new Error('Укажите название');
       const names = [...S.projects.values()].map(p => p.files['project.json']?.name?.toLowerCase());
       if (names.includes(val.name.toLowerCase())) throw new Error('Проект с таким названием уже есть');
       const taken = new Set([...S.projects.keys(), ...S.outbox.map(o => o.slug)]);
       const slug = M.slugify(val.name, taken);
       const files = M.emptyProject({ name: val.name, customer: val.customer, description: val.description, author: me() });
+      if (val.parent) files['project.json'].parent = val.parent;
+      const rel = form.getAll('related'); if (rel.length) files['project.json'].related = rel;
       const ok = await run(slug, { type: 'create', files }, `Новый проект «${val.name}»`);
       if (ok && !S.offline) location.hash = `#/p/${slug}/chat`;
       return ok;
@@ -623,6 +659,13 @@ async function openFile(path, name, { slug = null, editable = false } = {}) {
 }
 
 // ---- Обзор ----
+function linksBlock(pj) {
+  if (!pj || pj instanceof Error) return '';
+  const parent = pj.parent ? projById(pj.parent) : null, kids = childrenOf(pj.id), rel = relatedOf(pj);
+  return (pj.parent ? `<h2>Входит в проект</h2><div class="card">${parent ? projLink(parent) : `<div class="empty">Проект ${esc(pj.parent)} не найден</div>`}</div>` : '')
+    + (kids.length ? `<h2>Подпроекты</h2><div class="card">${kids.map(projLink).join('')}</div>` : '')
+    + (rel.length ? `<h2>Связанные проекты</h2><div class="card">${rel.map(projLink).join('')}</div>` : '');
+}
 function overTab(p, f, el) {
   const pj = f['project.json'];
   const docs = f['documents.json']?.documents || [], tasks = f['tasks.json']?.tasks || [], decisions = f['tasks.json']?.decisions || [];
@@ -640,12 +683,18 @@ function overTab(p, f, el) {
       <a class="tile" href="#/p/${enc}/files"><div class="v">${groupParts(p.fileEntries).length}</div><div class="l">${pluralWord(groupParts(p.fileEntries).length, 'файл', 'файла', 'файлов')}</div></a>
     </div>
     <h2>Описание</h2><div class="card pad body">${esc(pj?.description || 'Нет описания.')}</div>
+    ${linksBlock(pj)}
     ${prs.length ? `<h2>Предложения ИИ</h2><div class="card">${prs.map(pr => prRow(pr)).join('')}</div>` : ''}
     ${decisions.length ? `<h2>Последние решения</h2><div class="card">${decisions.slice(-3).reverse().map(d => `<div class="row"><div class="grow"><div class="t">${esc(d.title)}</div><div class="s">${fmtDate(d.date)} · ${esc(d.author)}</div></div></div>`).join('')}</div>` : ''}
     <div class="btns full" style="margin-top:14px"><button class="btn" id="editP">Изменить проект</button><button class="btn" id="zip">Скачать ZIP</button></div>
     <div class="btns full" style="margin-top:8px"><button class="btn" id="offline">Сохранить для работы без связи</button></div>`;
-  $('editP').onclick = () => sheet('Проект', input('name', 'Название', pj.name, 'required') + select('status', 'Статус', M.PROJECT_STATUSES, pj.status) + input('customer', 'Заказчик', pj.customer) + area('description', 'Описание', pj.description, 'style="min-height:160px"'),
-    v => { if (!v.name) throw new Error('Укажите название'); return run(p.slug, { type: 'set', file: 'project.json', fields: { name: v.name, status: v.status, customer: v.customer, description: v.description } }, `Изменён проект «${v.name}»`); });
+  $('editP').onclick = () => sheet('Проект', input('name', 'Название', pj.name, 'required') + select('status', 'Статус', M.PROJECT_STATUSES, pj.status) + input('customer', 'Заказчик', pj.customer) + area('description', 'Описание', pj.description, 'style="min-height:160px"') + linkFields(pj),
+    (v, form) => {
+      if (!v.name) throw new Error('Укажите название');
+      const rel = form.getAll('related');
+      if (v.parent && withDescendants(pj.id).has(v.parent)) throw new Error('Нельзя вложить проект в его собственный подпроект');
+      return run(p.slug, { type: 'set', file: 'project.json', fields: { name: v.name, status: v.status, customer: v.customer, description: v.description, parent: v.parent || null, related: rel.length ? rel : null } }, `Изменён проект «${v.name}»`);
+    });
   $('zip').onclick = () => zipProject(p, pj);
   $('offline').onclick = () => cacheProject(p);
 }
@@ -754,7 +803,7 @@ function nextRev(doc) {
 function docsTab(p, f, el) {
   const docs = f['documents.json']?.documents || [];
   el.innerHTML = `<div class="card">${docs.length ? docs.map(d => `
-    <div class="row"><div class="grow"><div class="t">${esc(d.name)}</div><div class="chips">${chip(d.format)}${chip(plural((d.revisions || []).length, 'редакция', 'редакции', 'редакций'))}</div></div><button class="btn small" data-addrev="${d.id}">+ Ред.</button></div>
+    <div class="row"><div class="grow"><div class="t">${esc(d.name)}</div><div class="chips">${chip(d.format)}${chip(plural((d.revisions || []).length, 'редакция', 'редакции', 'редакций'))}</div></div><button class="btn small" data-editdoc="${d.id}" aria-label="Переименовать">✎</button><button class="btn small" data-addrev="${d.id}">+ Ред.</button></div>
     ${(d.revisions || []).slice().reverse().map(r => `<div class="rev"><div class="r">${esc(r.rev)}</div><div class="grow">
       <div class="chips" style="margin-top:0">${chip(r.status, statusCls(r.status))}${chip(r.author, whoClass(r.author))}<span class="muted">${fmtDate(r.date)}</span></div>
       ${r.note ? `<div class="s" style="margin-top:4px">${esc(r.note)}</div>` : ''}
@@ -764,6 +813,14 @@ function docsTab(p, f, el) {
     <p class="muted" style="margin:10px 4px">Одна редакция — один неизменяемый файл. Чтобы изменить содержимое, создайте новую редакцию. «Разрешено к выдаче» ставит только ${esc(me())}; это отметка, а не замена инженерной проверки.</p>`;
   el.onclick = async e => {
     const o = e.target.closest('[data-open]'); if (o) return openFile(o.dataset.open, o.dataset.name);
+    const ed = e.target.closest('[data-editdoc]');
+    if (ed) {
+      const d = docs.find(x => x.id === ed.dataset.editdoc);
+      return sheet('Документ', input('name', 'Название', d.name, 'required') + select('format', 'Формат', M.DOC_FORMATS, d.format), v => {
+        if (!v.name) throw new Error('Укажите название');
+        return run(p.slug, { type: 'upsert', file: 'documents.json', list: 'documents', item: { id: d.id, name: v.name, format: v.format } }, `Документ «${d.name}» → «${v.name}»`);
+      });
+    }
     const a = e.target.closest('[data-addrev]'); if (a) return revSheet(p, docs.find(d => d.id === a.dataset.addrev));
     const s = e.target.closest('[data-status]'); if (s) {
       const [docId, revId] = s.dataset.status.split('|'); const d = docs.find(x => x.id === docId), r = d.revisions.find(x => x.id === revId);
