@@ -51,3 +51,49 @@ test('хранилище: validate.mjs проверяет связи проек�
   assert.match(run(), /цикл/);
   fs.rmSync(tmp, { recursive: true, force: true });
 });
+
+// --- Одновременные правки связей: проверка по свежему дереву внутри записи (mutate → buildChanges) ---
+async function linkRepo() {
+  const { createFakeGitHub } = await import(path.join(__dirname, 'fixtures/fake-github.mjs'));
+  const { templateFiles } = await import(path.join(__dirname, 'fixtures/template-seed.mjs'));
+  const base = templateFiles(), A = 'projects/primer-ograzhdenie/', files = { ...base };
+  const aPj = JSON.parse(new TextDecoder().decode(base[A + 'project.json']));
+  for (const f of ['documents.json', 'tasks.json', 'sources.json', 'cost.json']) files['projects/c-proekt/' + f] = base[A + f];
+  files['projects/c-proekt/project.json'] = JSON.stringify(pj('p-cccccc111111'));
+  const gh = createFakeGitHub({ files, token: 'tok' });
+  const G = await mod('github.js'), O = await mod('ops.js');
+  const client = G.createClient({ owner: 'rrrig', repo: 'RRR', token: 'tok', fetch: gh.fetch });
+  const send = op => client.mutate('[Дмитрий] связь', ({ read, files: tree }) => O.buildChanges(op.slug, op, read, async () => null, tree));
+  const setC = parent => gh.aiCommit({ author: 'ChatGPT', files: { 'projects/c-proekt/project.json': JSON.stringify(pj('p-cccccc111111', parent ? { parent } : {})) } });
+  const readPj = async slug => JSON.parse(await client.blobText((await client.tree((await client.head()).tree)).find(e => e.path === `projects/${slug}/project.json`).sha));
+  return { gh, client, send, setC, readPj, aId: aPj.id, setA: parent => ({ type: 'set', slug: 'primer-ograzhdenie', file: 'project.json', fields: { parent } }) };
+}
+
+test('конкурентно: C.parent=A записан другим устройством до отправки — A.parent=C отклоняется, цикл в main не попадает', async () => {
+  const r = await linkRepo();
+  r.setC(r.aId);                                       // другое устройство: C входит в A (само по себе корректно)
+  await assert.rejects(r.send(r.setA('p-cccccc111111')), /Связь проектов не сохранена: цикл/);
+  assert.equal((await r.readPj('primer-ograzhdenie')).parent, undefined);
+});
+
+test('конкурентно: правка между чтением и обновлением ref — повтор mutate проверяет связи заново', async () => {
+  const r = await linkRepo();
+  r.gh.beforeRefUpdate = () => r.setC(r.aId);           // C.parent=A появляется в момент записи → конфликт → повтор
+  await assert.rejects(r.send(r.setA('p-cccccc111111')), /цикл/);
+  assert.equal((await r.readPj('primer-ograzhdenie')).parent, undefined);
+  assert.equal((await r.readPj('c-proekt')).parent, r.aId);
+});
+
+test('очередь с телефона: родитель удалён на сервере, пока изменение ждало отправки — отказ «нет такого проекта»', async () => {
+  const r = await linkRepo();
+  const queued = r.setA('p-cccccc111111');               // поставлено в очередь без связи
+  r.gh.aiCommit({ author: 'ChatGPT', files: Object.fromEntries(['project.json', 'documents.json', 'tasks.json', 'sources.json', 'cost.json'].map(f => ['projects/c-proekt/' + f, null])) });
+  await assert.rejects(r.send(queued), /нет такого проекта/);
+});
+
+test('корректная связь сохраняется; чужая старая ошибка в другом проекте не мешает', async () => {
+  const r = await linkRepo();
+  r.gh.aiCommit({ author: 'ChatGPT', files: { 'projects/c-proekt/project.json': JSON.stringify(pj('p-cccccc111111', { related: ['p-ffffff000000'] })) } });
+  await r.send(r.setA('p-cccccc111111'));
+  assert.equal((await r.readPj('primer-ograzhdenie')).parent, 'p-cccccc111111');
+});
