@@ -5,8 +5,9 @@ import { createClient, isNetworkError, isTemporaryError } from './github.js';
 import { buildChanges, preview } from './ops.js';
 import * as C from './cache.js';
 import { makeZip } from './zip.js';
+import { splitBlob, assembleParts, groupParts, needsParts } from './bigfile.js';
 
-const VERSION = '0.10.0';
+const VERSION = '0.11.0';
 const SETTINGS_KEY = 'ignis-pro-settings';
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -220,7 +221,7 @@ async function send(op) {
     if (!bytes) throw new Error('Файл для отправки не найден на телефоне');
     return (shas[u.key] = await S.client.createBlob(new Uint8Array(bytes)));
   };
-  await S.client.mutate(`[${op.author || me()}] ${op.label}`, ({ read }) => buildChanges(op.slug, op, read, blobSha));
+  await S.client.mutate(`[${op.author || me()}] ${op.label}`, ({ read, files }) => buildChanges(op.slug, op, read, blobSha, files));
   for (const u of op.uploads || []) {
     const bytes = await C.get('uploads', u.key).catch(() => null);
     if (bytes && shas[u.key]) await C.put('blobs', shas[u.key], bytes).catch(() => {});
@@ -253,15 +254,29 @@ function viewFiles(p) {
 }
 
 // Сохранение выбранного файла на телефоне перед отправкой
+// Файл больше 50 МБ автоматически делится на части по 20 МБ (bigfile.js); uploads — по одной на часть.
 async function stageFile(file, kind, slug, id) {
-  if (file.size > M.MAX_FILE_BYTES) throw new Error(`Файл «${file.name}» больше ${fmtSize(M.MAX_FILE_BYTES)}`);
+  const name = (id ? id + '-' : '') + repoName(file.name);
+  return stageAt(file, `projects/${slug}/files/${kind}/${name}`);
+}
+// Большой файл: части + манифест <path>.parts.json (по нему файл собирается и проверяется).
+async function stageAt(file, path) {
+  if (needsParts(file.size)) {
+    const uploads = [];
+    toast(`Готовлю «${file.name}» (${fmtSize(file.size)}) частями по 20 МБ…`);
+    const ref = await splitBlob(file, path, file.name, async (part, bytes) => {
+      const key = M.newId('u'); await C.put('uploads', key, bytes); uploads.push({ path: part.path, key });
+    });
+    const mkey = M.newId('u');
+    await C.put('uploads', mkey, new TextEncoder().encode(JSON.stringify(M.toManifest(ref), null, 2) + '\n').buffer);
+    uploads.push({ path: M.manifestPath(path), key: mkey });
+    return { ref, uploads };
+  }
   const bytes = await file.arrayBuffer();
   const sha256 = [...new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))].map(b => b.toString(16).padStart(2, '0')).join('');
   const key = M.newId('u');
   await C.put('uploads', key, bytes);
-  const name = (id ? id + '-' : '') + repoName(file.name);
-  const path = `projects/${slug}/files/${kind}/${name}`;
-  return { ref: { path, name: file.name, size: file.size, sha256 }, upload: { path, key } };
+  return { ref: { path, name: file.name, size: file.size, sha256 }, uploads: [{ path, key }] };
 }
 
 // ---------------- Шторка-форма ----------------
@@ -489,7 +504,7 @@ function chatTab(p, f, el) {
     try {
       const files = [], uploads = [];
       const id = M.newId('m');
-      for (const file of files0) { const st = await stageFile(file, 'chat', p.slug, id); files.push(st.ref); uploads.push(st.upload); }
+      for (const file of files0) { const st = await stageFile(file, 'chat', p.slug, id); files.push(st.ref); uploads.push(...st.uploads); }
       const msg = M.newChatMessage({ author: me(), text: text || 'Файлы', files, mentions: M.mentionsIn(text), replyTo: reply0 || undefined });
       msg.id = id;
       ok = await run(p.slug, { type: 'chat', message: msg, uploads }, `Сообщение в чате «${pj?.name || p.slug}»`);
@@ -539,31 +554,49 @@ function manualHelp(p, pj) {
 }
 
 // ---- Открытие файлов ----
+// Где сейчас лежит путь: сначала самые новые изменения из очереди на телефоне (они ещё не
+// отправлены, но уже действуют), затем принятая версия. Замена или удаление файла в очереди
+// скрывает его прежнее представление (целый файл, части, манифест).
 function findEntry(path) {
-  const e = S.entries.get(path); if (e) return { sha: e.sha, size: e.size };
-  for (const o of S.outbox) for (const u of o.uploads || []) if (u.path === path) return { key: u.key };
-  return null;
+  const L = M.wholeOf(path) || path;
+  for (let i = S.outbox.length - 1; i >= 0; i--) {
+    const o = S.outbox[i];
+    for (const u of o.uploads || []) if (u.path === path) return { key: u.key };
+    if ((o.replace || []).includes(L) || (o.type === 'deleteFile' && o.path === L)) return null;
+  }
+  const e = S.entries.get(path); return e ? { sha: e.sha, size: e.size } : null;
 }
+const hasFile = path => !!(findEntry(path) || findEntry(M.manifestPath(path)));
+async function partBytes(path) {
+  const e = findEntry(path);
+  if (!e) return null;
+  return e.key ? C.get('uploads', e.key) : blobBytes(e.sha);
+}
+// ArrayBuffer для обычного файла; Blob, собранный из частей, — для большого.
 async function fileBytes(path) {
   const e = findEntry(path);
-  if (!e) throw new Error('Файл ещё не принят в проект или удалён');
-  if (e.key) return C.get('uploads', e.key);
-  return blobBytes(e.sha);
+  if (e) return e.key ? C.get('uploads', e.key) : blobBytes(e.sha);
+  const mBytes = await partBytes(M.manifestPath(path));
+  if (!mBytes) throw new Error('Файл ещё не принят в проект или удалён');
+  let manifest;
+  try { manifest = JSON.parse(new TextDecoder().decode(mBytes)); } catch { throw new Error('Описание частей файла повреждено'); }
+  return assembleParts(manifest, partBytes, (i, n) => { const pg = $('pgF'); if (pg) pg.style.width = (100 * i / n) + '%'; });
 }
 const mime = ext => ({ pdf: 'application/pdf', jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', webp: 'image/webp', heic: 'image/heic', svg: 'image/svg+xml', txt: 'text/plain', md: 'text/plain', csv: 'text/csv', json: 'application/json', zip: 'application/zip', xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', dxf: 'image/vnd.dxf', stl: 'model/stl', step: 'model/step', stp: 'model/step' }[ext] || 'application/octet-stream');
 async function openFile(path, name, { slug = null, editable = false } = {}) {
   name = name || path.split('/').pop();
-  sheet(name, '<div class="empty">Загрузка файла…</div>');
+  sheet(name, '<div class="empty">Загрузка файла…</div><div class="progress"><i id="pgF" style="width:0"></i></div>');
   let bytes;
   try { bytes = await fileBytes(path); } catch (e) { $('sheetBody').innerHTML = `<div class="errors">${esc(e.message)}</div>`; return; }
+  const size = bytes instanceof Blob ? bytes.size : bytes.byteLength;
   const ext = extOf(name), blob = new Blob([bytes], { type: mime(ext) }), url = URL.createObjectURL(blob);
   const file = new File([blob], name, { type: blob.type });
-  const isText = TEXT_EXT.includes(ext) && bytes.byteLength < 2 * 1024 * 1024;
+  const isText = !(bytes instanceof Blob) && TEXT_EXT.includes(ext) && size < 2 * 1024 * 1024;
   let preview = '';
   if (IMG_EXT.includes(ext) || ext === 'svg') preview = `<img class="preview" src="${url}" alt="">`;
   else if (isText) preview = editable ? area('content', 'Содержимое', new TextDecoder().decode(bytes), 'style="min-height:45vh;font:13px ui-monospace,Menlo,monospace"') : `<pre class="prompt" style="max-height:50vh;overflow:auto">${esc(new TextDecoder().decode(bytes))}</pre>`;
-  else if (ext === 'pdf') preview = `<p class="muted">PDF · ${fmtSize(bytes.byteLength)}. Откройте для просмотра или сохраните в «Файлы».</p>`;
-  else preview = `<p class="muted">${esc(ext.toUpperCase() || 'Файл')} · ${fmtSize(bytes.byteLength)}. Сохраните в «Файлы» или откройте в подходящем приложении (САПР, просмотрщик).</p>`;
+  else if (ext === 'pdf') preview = `<p class="muted">PDF · ${fmtSize(size)}. Откройте для просмотра или сохраните в «Файлы».</p>`;
+  else preview = `<p class="muted">${esc(ext.toUpperCase() || 'Файл')} · ${fmtSize(size)}${bytes instanceof Blob ? ' · собран из частей, контрольные суммы совпали' : ''}. Сохраните в «Файлы» или откройте в подходящем приложении (САПР, просмотрщик).</p>`;
   const canShare = navigator.canShare?.({ files: [file] });
   $('sheetBody').innerHTML = `${preview}
     <div class="btns full" style="margin-top:12px">
@@ -578,13 +611,12 @@ async function openFile(path, name, { slug = null, editable = false } = {}) {
     sheetSubmit = async v => {
       const bytesNew = new TextEncoder().encode(v.content ?? ''); const key = M.newId('u');
       await C.put('uploads', key, bytesNew.buffer);
-      return run(slug, { type: 'writeFile', uploads: [{ path, key }] }, `Изменён файл ${name}`);
+      return run(slug, { type: 'writeFile', uploads: [{ path, key }], replace: [path] }, `Изменён файл ${name}`);
     };
     $('replaceF').onchange = async e => {
       const fl = e.target.files[0]; if (!fl) return;
-      if (fl.size > M.MAX_FILE_BYTES) return toast('Файл больше 50 МБ', true);
-      const key = M.newId('u'); await C.put('uploads', key, await fl.arrayBuffer());
-      if (await run(slug, { type: 'writeFile', uploads: [{ path, key }] }, `Заменён файл ${name}`)) closeSheet();
+      let st; try { st = await stageAt(fl, path); } catch (err) { return toast(err.message, true); }
+      if (await run(slug, { type: 'writeFile', uploads: st.uploads, replace: [path] }, `Заменён файл ${name}`)) closeSheet();
     };
     $('delF').onclick = async () => { if (confirm(`Удалить файл «${name}» из проекта? Он останется в истории GitHub.`) && await run(slug, { type: 'deleteFile', path }, `Удалён файл ${name}`)) closeSheet(); };
   }
@@ -605,7 +637,7 @@ function overTab(p, f, el) {
       <a class="tile" href="#/p/${enc}/docs"><div class="v">${docs.length}</div><div class="l">${pluralWord(docs.length, 'документ', 'документа', 'документов')} · к выдаче ${approved}</div></a>
       <a class="tile" href="#/p/${enc}/tasks"><div class="v">${openTasks}</div><div class="l">${pluralWord(openTasks, 'открытая задача', 'открытые задачи', 'открытых задач')} из ${tasks.length}</div></a>
       <a class="tile" href="#/p/${enc}/cost"><div class="v money">${t ? M.rub(t.total) : '—'}</div><div class="l">себестоимость без НДС</div></a>
-      <a class="tile" href="#/p/${enc}/files"><div class="v">${p.fileEntries.length}</div><div class="l">${pluralWord(p.fileEntries.length, 'файл', 'файла', 'файлов')}</div></a>
+      <a class="tile" href="#/p/${enc}/files"><div class="v">${groupParts(p.fileEntries).length}</div><div class="l">${pluralWord(groupParts(p.fileEntries).length, 'файл', 'файла', 'файлов')}</div></a>
     </div>
     <h2>Описание</h2><div class="card pad body">${esc(pj?.description || 'Нет описания.')}</div>
     ${prs.length ? `<h2>Предложения ИИ</h2><div class="card">${prs.map(pr => prRow(pr)).join('')}</div>` : ''}
@@ -630,16 +662,25 @@ async function cacheProject(p) {
   $('sheetBody').innerHTML = `<p>${failed ? `Сохранено ${done - failed}, не удалось ${failed}.` : 'Готово. Проект можно открывать, скачивать и менять без связи. Изменения отправятся автоматически, когда связь появится.'}</p>`;
   } finally { endBulk(b); }
 }
+// Содержимое файла для ZIP: части большого файла собираются в один файл с исходным именем пути.
+async function zipBytes(g) {
+  if (!g.parts) return new Uint8Array(await blobBytes(S.entries.get(g.path).sha));
+  const data = await fileBytes(g.path);
+  return new Uint8Array(data instanceof Blob ? await data.arrayBuffer() : data);
+}
+const sizeOf = paths => paths.reduce((n, x) => n + (S.entries.get(x)?.size || 0), 0);
 async function zipProject(p, pj) {
+  const paths0 = await projectPaths(p), total = sizeOf(paths0);
+  if (total > ZIP_WARN && !confirm(`Архив проекта займёт около ${fmtSize(total)}. На телефоне это может не поместиться в память. Надёжнее скачать на компьютере. Продолжить?`)) return;
   const b = startBulk('сборка ZIP проекта'); if (!b) return;
   try {
-  const paths = await projectPaths(p);
+  const paths = groupParts(paths0.map(path => ({ path })));
   sheet('Архив проекта', `<p>Собираю ${plural(paths.length, 'файл', 'файла', 'файлов')}…</p><div class="progress"><i id="pg" style="width:0"></i></div>`);
   let done = 0; const missing = [];
   const files = [];
-  await bulkPool(paths, b, async path => {
-    try { files.push({ name: path.slice(`projects/${p.slug}/`.length), bytes: new Uint8Array(await blobBytes(S.entries.get(path).sha)) }); }
-    catch { missing.push(path); }
+  await bulkPool(paths, b, async g => {
+    try { files.push({ name: g.path.slice(`projects/${p.slug}/`.length), bytes: await zipBytes(g) }); }
+    catch { missing.push(g.path); }
     finally { done++; const pg = $('pg'); if (pg) pg.style.width = (100 * done / paths.length) + '%'; }
   });
   if (b.cancelled) return;
@@ -681,17 +722,17 @@ async function cacheAll() {
 }
 const ZIP_WARN = 300 * 1048576;
 async function zipAll() {
-  const paths = allPaths();
-  const total = paths.reduce((n, p) => n + (S.entries.get(p)?.size || 0), 0);
+  const paths0 = allPaths(), total = sizeOf(paths0);
+  const paths = groupParts(paths0.map(path => ({ path })));
   if (total > ZIP_WARN && !confirm(`Архив займёт около ${fmtSize(total)}. На телефоне это может не поместиться в память. Надёжнее скачать полную копию на компьютере (GitHub Desktop). Продолжить?`)) return;
   const b = startBulk('сборка ZIP всего архива'); if (!b) return;
   try {
   sheet('Весь архив', `<p>Собираю ${plural(paths.length, 'файл', 'файла', 'файлов')}…</p><div class="progress"><i id="pg" style="width:0"></i></div>`);
   let done = 0; const missing = [];
   const files = [];
-  await bulkPool(paths, b, async path => {
-    try { files.push({ name: path, bytes: new Uint8Array(await blobBytes(S.entries.get(path).sha)) }); }
-    catch { missing.push(path); }
+  await bulkPool(paths, b, async g => {
+    try { files.push({ name: g.path, bytes: await zipBytes(g) }); }
+    catch { missing.push(g.path); }
     finally { done++; const pg = $('pg'); if (pg) pg.style.width = (100 * done / paths.length) + '%'; }
   });
   if (b.cancelled) return;
@@ -736,7 +777,7 @@ function docsTab(p, f, el) {
       const rid = M.newId('r'), item = { id: rid, rev: v.rev || 'R01', status: 'Не проверено', date: M.today(), author: me() };
       if (v.note) item.note = v.note;
       const fl = form.get('file'); const uploads = [];
-      if (fl && fl.size) { const s = await stageFile(fl, 'docs', p.slug, rid); item.file = s.ref; uploads.push(s.upload); }
+      if (fl && fl.size) { const s = await stageFile(fl, 'docs', p.slug, rid); item.file = s.ref; uploads.push(...s.uploads); }
       return run(p.slug, { type: 'upsert', file: 'documents.json', list: 'documents', item: { id: M.newId('d'), name: v.name, format: v.format, revisions: [item] }, uploads }, `Новый документ «${v.name}» ${item.rev}`);
     }, 'Создать');
 }
@@ -747,7 +788,7 @@ function revSheet(p, d) {
       const rid = M.newId('r'), item = { id: rid, rev: v.rev, status: 'Не проверено', date: M.today(), author: me() };
       if (v.note) item.note = v.note;
       const fl = form.get('file'); const uploads = [];
-      if (fl && fl.size) { const s = await stageFile(fl, 'docs', p.slug, rid); item.file = s.ref; uploads.push(s.upload); }
+      if (fl && fl.size) { const s = await stageFile(fl, 'docs', p.slug, rid); item.file = s.ref; uploads.push(...s.uploads); }
       return run(p.slug, { type: 'revision', docId: d.id, item, uploads }, `${d.name}: редакция ${v.rev}`);
     }, 'Добавить');
 }
@@ -756,7 +797,10 @@ function revSheet(p, d) {
 const KIND_NAMES = { work: 'Рабочие файлы', docs: 'Файлы документов', sources: 'Источники', chat: 'Из чата' };
 function filesTab(p, f, el) {
   const pend = pendingFor(p.slug).flatMap(o => (o.uploads || []).map(u => ({ path: u.path, pending: true, kind: u.path.split('/')[3] })));
-  const all = [...p.fileEntries, ...pend.filter(x => !S.entries.has(x.path))];
+  // Части большого файла показываются одним файлом.
+  // Принятые файлы, которые ещё не заменены и не удалены изменениями из очереди, + ожидающие отправки.
+  const all = groupParts([...p.fileEntries.filter(x => findEntry(x.path)?.sha), ...pend.filter((x, i, arr) => findEntry(x.path)?.key && arr.findIndex(y => y.path === x.path) === i)])
+    .map(g => g.parts ? { ...g.item, path: g.path, big: true, size: g.parts.reduce((n, x) => n + (x.size || 0), 0), pending: [...g.parts, g.manifest].some(x => x?.pending) } : g.item);
   const names = new Map();
   // Имя файла и откуда он: документ, источник или сообщение чата.
   for (const d of f['documents.json']?.documents || []) for (const r of d.revisions || []) if (r.file) names.set(r.file.path, { name: r.file.name, ctx: `${d.name}, ${r.rev}` });
@@ -764,19 +808,23 @@ function filesTab(p, f, el) {
   for (const m of p.chat || []) for (const x of m.files || []) names.set(x.path, { name: x.name, ctx: `${m.author}, ${fmtTime(m.date)}` });
   el.innerHTML = Object.keys(KIND_NAMES).map(kind => {
     const items = all.filter(x => x.kind === kind); if (!items.length && kind !== 'work') return '';
-    return `<h2>${KIND_NAMES[kind]}</h2><div class="card">${items.length ? items.map(x => `<button class="row" data-open="${esc(x.path)}" data-kind="${kind}">
+    return `<h2>${KIND_NAMES[kind]}</h2><div class="card">${items.length ? items.map(x => `<button class="row" data-open="${esc(x.path)}" data-kind="${kind}"${x.big ? ' data-big="1"' : ''}>
       <span class="ficon">${IMG_EXT.includes(extOf(x.path)) ? '🖼' : TEXT_EXT.includes(extOf(x.path)) ? '📝' : ['stl', 'step', 'stp', 'sldprt', 'obj', '3mf'].includes(extOf(x.path)) ? '🧊' : '📄'}</span>
       <div class="grow"><div class="t">${esc(names.get(x.path)?.name || x.path.split('/').pop())}</div><div class="s">${[names.get(x.path)?.ctx ? esc(names.get(x.path).ctx) : '', x.pending ? '⏳ ждёт отправки' : fmtSize(x.size || 0), kind === 'work' ? 'можно изменить' : ''].filter(Boolean).join(' · ')}</div></div><span class="chev">›</span></button>`).join('') : '<div class="empty">Пусто. Здесь лежат расчёты, черновики, программы для ЧПУ — всё, над чем работаем.</div>'}</div>`;
   }).join('') + `
     <div class="btns full" style="margin-top:12px"><label class="btn primary">Загрузить файлы<input type="file" id="upWork" multiple hidden></label><button class="btn" id="newText">Новый текстовый файл</button></div>
     <div class="btns full" style="margin-top:8px"><button class="btn" id="zip2">Скачать всё (ZIP)</button><button class="btn" id="off2">Сохранить без связи</button></div>`;
-  el.onclick = e => { const o = e.target.closest('[data-open]'); if (o) openFile(o.dataset.open, names.get(o.dataset.open)?.name || null, { slug: p.slug, editable: o.dataset.kind === 'work' }); };
+  el.onclick = e => { const o = e.target.closest('[data-open]'); if (o) openFile(o.dataset.open, names.get(o.dataset.open)?.name || null, { slug: p.slug, editable: o.dataset.kind === 'work' && !o.dataset.big }); };
   $('upWork').onchange = async e => {
     const files = [...e.target.files]; if (!files.length) return;
     try {
-      const uploads = [];
-      for (const fl of files) { const s = await stageFile(fl, 'work', p.slug); if (S.entries.has(s.upload.path) && !confirm(`Файл ${fl.name} уже есть. Заменить?`)) continue; uploads.push(s.upload); }
-      if (uploads.length) await run(p.slug, { type: 'writeFile', uploads }, `Загружено файлов: ${uploads.length}`);
+      const uploads = [], replace = [];
+      for (const fl of files) {
+        const path = `projects/${p.slug}/files/work/${repoName(fl.name)}`;
+        if (hasFile(path) && !confirm(`Файл ${fl.name} уже есть. Заменить?`)) continue;
+        const s = await stageAt(fl, path); uploads.push(...s.uploads); replace.push(path);
+      }
+      if (replace.length) await run(p.slug, { type: 'writeFile', uploads, replace }, `Загружено файлов: ${replace.length}`);
     } catch (err) { toast(err.message, true); }
   };
   $('newText').onclick = () => sheet('Новый файл', input('name', 'Имя файла', '', 'required placeholder="raschet.txt, programma.nc, zametki.md"') + area('content', 'Содержимое', '', 'style="min-height:40vh;font:13px ui-monospace,Menlo,monospace"'),
@@ -884,8 +932,8 @@ function sourcesTab(p, f, el) {
     try {
       const list = [...e.target.files]; if (!list.length) return;
       const ops = [];
-      for (const fl of list) { const id = M.newId('s'); const s = await stageFile(fl, 'sources', p.slug, id); ops.push({ item: { id, type: 'Фото', title: fl.name.replace(/\.[^.]+$/, ''), origin: me(), date: M.today(), file: s.ref }, upload: s.upload }); }
-      for (const o of ops) await run(p.slug, { type: 'upsert', file: 'sources.json', list: 'sources', item: o.item, uploads: [o.upload] }, `Фото «${o.item.title}»`);
+      for (const fl of list) { const id = M.newId('s'); const s = await stageFile(fl, 'sources', p.slug, id); ops.push({ item: { id, type: 'Фото', title: fl.name.replace(/\.[^.]+$/, ''), origin: me(), date: M.today(), file: s.ref }, uploads: s.uploads }); }
+      for (const o of ops) await run(p.slug, { type: 'upsert', file: 'sources.json', list: 'sources', item: o.item, uploads: o.uploads }, `Фото «${o.item.title}»`);
     } catch (err) { toast(err.message, true); }
   };
   $('addSrc').onclick = () => sheet('Источник', select('type', 'Тип', M.SOURCE_TYPES.filter(x => x !== 'Фото'), '3D-модель') + input('title', 'Название', '', 'required') + field('Файл', '<input type="file" name="file">') + input('url', 'Ссылка', '', 'type="url" placeholder="https://"') + area('note', 'Примечание'),
@@ -893,7 +941,7 @@ function sourcesTab(p, f, el) {
       if (!v.title) throw new Error('Укажите название');
       const id = M.newId('s'), item = { id, type: v.type, title: v.title, origin: me(), date: M.today() }, uploads = [];
       if (v.url) item.url = v.url; if (v.note) item.note = v.note;
-      const fl = form.get('file'); if (fl && fl.size) { const s = await stageFile(fl, 'sources', p.slug, id); item.file = s.ref; uploads.push(s.upload); }
+      const fl = form.get('file'); if (fl && fl.size) { const s = await stageFile(fl, 'sources', p.slug, id); item.file = s.ref; uploads.push(...s.uploads); }
       if (!item.file && !item.url && !item.note) throw new Error('Добавьте файл, ссылку или примечание');
       return run(p.slug, { type: 'upsert', file: 'sources.json', list: 'sources', item, uploads }, `Источник «${v.title}»`);
     }, 'Добавить');

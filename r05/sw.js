@@ -4,17 +4,19 @@
 // GitHub Pages) — открывается последняя сохранённая. Данные проектов здесь не хранятся:
 // они в IndexedDB приложения (pro/cache.js). Запросы к другим сайтам (api.github.com и др.)
 // не перехватываются.
-const CACHE = 'ignis-pro-shell-v1';
+const CACHE = 'ignis-pro-shell-v2';
 const SHELL = [
   './',
-  './pro/app.js?v=0.10.0',
-  './pro/styles.css?v=0.10.0',
+  './pro/app.js?v=0.11.0',
+  './pro/styles.css?v=0.11.0',
   './pro/model.js',
   './pro/github.js',
   './pro/ops.js',
   './pro/cache.js',
   './pro/zip.js',
-  './manifest.webmanifest?v=0.10.0',
+  './pro/bigfile.js',
+  './sha256.js',
+  './manifest.webmanifest?v=0.11.0',
   '../assets/ignis-pro-180.png',
   '../assets/ignis-pro-192.png',
   '../assets/ignis-pro-512.png',

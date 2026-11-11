@@ -1,7 +1,7 @@
 // Изменения пользователя в виде данных («операций»).
 // Одна и та же операция применяется сразу (при связи) или позже из очереди (без связи)
 // к самой свежей версии проекта — поэтому чужие изменения не затираются.
-import { PROJECT_FILES, APPROVED, today, validateFile, validateChatMessage, chatFileName, CHAT_DIR, validFilePath } from './model.js';
+import { PROJECT_FILES, APPROVED, today, validateFile, validateChatMessage, chatFileName, CHAT_DIR, validFilePath, wholeOf } from './model.js';
 
 const clone = x => (x === undefined ? undefined : JSON.parse(JSON.stringify(x)));
 // Слияние записи: поля со значением null удаляются (так форма сообщает «поле очищено»),
@@ -78,7 +78,15 @@ function findDoc(f, id) {
 
 // Построить список изменений файлов репозитория для одной операции.
 // read(path) → текст или undefined; blobSha(key) → sha уже загруженного файла.
-export async function buildChanges(slug, op, read, blobSha) {
+// Все пути, которыми сейчас представлен файл L в дереве: сам L, его части L.partNNN и манифест L.parts.json.
+function representation(tree, L) {
+  const out = [];
+  if (tree) for (const p of tree.keys()) if (p === L || wholeOf(p) === L) out.push(p);
+  return out;
+}
+// tree — Map путей текущего дерева (из mutate); нужен, чтобы при замене и удалении убрать
+// старое представление файла (целый файл, части, манифест) в том же коммите.
+export async function buildChanges(slug, op, read, blobSha, tree = null) {
   const dir = `projects/${slug}/`;
   const changes = [];
   if (op.type === 'chat') {
@@ -89,10 +97,18 @@ export async function buildChanges(slug, op, read, blobSha) {
     if (await read(path) === undefined) changes.push({ path, text: JSON.stringify(op.message, null, 2) + '\n' });
   } else if (op.type === 'deleteFile') {
     if (!validFilePath(op.path, slug)) throw new Error('Удалять можно только файлы проекта');
-    if (await read(op.path) === undefined && !op.force) throw new Error('Файл уже удалён');
-    changes.push({ path: op.path, delete: true });
+    const rep = tree ? representation(tree, op.path) : (await read(op.path) === undefined ? [] : [op.path]);
+    if (!rep.length && !op.force) throw new Error('Файл уже удалён');
+    for (const p of rep) changes.push({ path: p, delete: true });
+    if (!rep.length) changes.push({ path: op.path, delete: true });
   } else if (op.type === 'writeFile') {
     for (const u of op.uploads || []) if (!validFilePath(u.path, slug)) throw new Error('Неверный путь файла: ' + u.path);
+    // Замена: всё прежнее представление файла, которого нет среди новых загрузок, удаляется.
+    const keep = new Set((op.uploads || []).map(u => u.path));
+    for (const L of op.replace || []) {
+      if (!validFilePath(L, slug)) throw new Error('Неверный путь файла: ' + L);
+      for (const p of representation(tree, L)) if (!keep.has(p)) changes.push({ path: p, delete: true });
+    }
   } else {
     const files = {}, before = {};
     for (const name of PROJECT_FILES) {
