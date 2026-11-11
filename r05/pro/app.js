@@ -589,8 +589,8 @@ window.visualViewport?.addEventListener('resize', () => { if (document.body.clas
 // в буфер готовую команду: в сохранённом рабочем чате — короткое «чат …», в новом чате — полное
 // задание (ИИ там не знает контекста). Ссылка открывается сразу по нажатию, без ожидания буфера.
 const AI = {
-  claude: { name: 'Claude', key: 'claudeUrl', fresh: q => 'https://claude.ai/new?q=' + encodeURIComponent(q), ok: /^https:\/\/claude\.ai\// },
-  chatgpt: { name: 'ChatGPT', key: 'chatgptUrl', fresh: q => 'https://chatgpt.com/?q=' + encodeURIComponent(q), ok: /^https:\/\/(chatgpt\.com|chat\.openai\.com)\// }
+  claude: { name: 'Claude', key: 'claudeUrl', fresh: q => 'https://claude.ai/new?q=' + encodeURIComponent(q), ok: /^https:\/\/claude\.ai\/(chat|code|project)\/[^\s]+$/ },
+  chatgpt: { name: 'ChatGPT', key: 'chatgptUrl', fresh: q => 'https://chatgpt.com/?q=' + encodeURIComponent(q), ok: /^https:\/\/(chatgpt\.com|chat\.openai\.com)\/(c\/|g\/[^/\s]+\/c\/)[^\s]+$/ }
 };
 function callText(p, pj, full) {
   const name = pj?.name || p.slug;
@@ -600,12 +600,23 @@ function callUrl(who, p, pj) {
   const a = AI[who], saved = S.settings[a.key];
   return saved && a.ok.test(saved) ? saved : a.fresh(callText(p, pj, true));
 }
+// Копирование синхронно (execCommand) — успевает до ухода со страницы на iOS; Clipboard API — запасной.
+function copyNow(text) {
+  let ok = false;
+  try {
+    const t = document.createElement('textarea');
+    t.value = text; t.setAttribute('readonly', ''); t.style.cssText = 'position:fixed;top:0;left:0;opacity:0;font-size:16px';
+    document.body.appendChild(t); t.select(); t.setSelectionRange(0, text.length);
+    ok = document.execCommand('copy'); t.remove();
+  } catch { ok = false; }
+  if (!ok && navigator.clipboard) navigator.clipboard.writeText(text).catch(() => {});
+  return ok;
+}
 function callAi(who, p, pj) {
   const a = AI[who], saved = S.settings[a.key] && a.ok.test(S.settings[a.key]);
-  const text = callText(p, pj, !saved);
-  navigator.clipboard?.writeText(text).then(
-    () => toast(saved ? `Команда скопирована — вставьте в чат ${a.name} и отправьте` : `Задание скопировано — отправьте его в ${a.name}`),
-    () => toast(`Откройте ${a.name} и напишите: чат`, true));
+  const ok = copyNow(callText(p, pj, !saved));
+  toast(ok ? (saved ? `Команда скопирована — вставьте в чат ${a.name} и отправьте` : `Задание скопировано — вставьте в ${a.name} и отправьте`)
+    : `Не удалось скопировать: вернитесь и нажмите «Задание» → «Скопировать»`, !ok);
 }
 function taskPrompt(p, pj) {
   const repo = `${S.settings.owner}/${S.settings.repo}`;
@@ -1135,7 +1146,7 @@ async function settingsView(v) {
       ${input('me', 'Ваше имя в чате', st.me)}
       ${input('claudeUrl', 'Рабочий чат Claude (ссылка)', st.claudeUrl, 'type="url" inputmode="url" autocapitalize="off" autocorrect="off" placeholder="https://claude.ai/chat/…"')}
       ${input('chatgptUrl', 'Рабочий чат ChatGPT (ссылка)', st.chatgptUrl, 'type="url" inputmode="url" autocapitalize="off" autocorrect="off" placeholder="https://chatgpt.com/c/…"')}
-      <p class="note" style="margin:-4px 0 10px">Кнопки «Позвать» в чате проекта открывают эти чаты. Ссылка: в Claude или ChatGPT откройте рабочий чат → «Поделиться» / ⋯ → «Копировать ссылку». Пусто — откроется новый чат с готовым заданием.</p>
+      <p class="note" style="margin:-4px 0 10px">Кнопки «Позвать» в чате проекта открывают эти чаты. Нужен адрес <b>самого рабочего чата</b>, не публичная ссылка «Поделиться» (<code>/share/</code> не подходит): откройте чат в Safari на claude.ai или chatgpt.com и скопируйте адрес из строки браузера — вида <code>claude.ai/chat/…</code> и <code>chatgpt.com/c/…</code>. Пусто — откроется новый чат, задание будет в буфере.</p>
       <div class="btns full"><button class="btn primary">Сохранить и проверить</button></div>
       <div id="connState" class="muted" style="margin-top:10px">${S.connMsg || ''}</div>
     </form>
@@ -1170,7 +1181,7 @@ async function settingsView(v) {
     if (!fd.owner.trim() || !fd.repo.trim()) { $('connState').innerHTML = '<span class="bad">Укажите владельца и репозиторий.</span>'; return; }
     for (const [k, a] of [['claudeUrl', AI.claude], ['chatgptUrl', AI.chatgpt]]) {
       fd[k] = (fd[k] || '').trim();
-      if (fd[k] && !a.ok.test(fd[k])) { $('connState').innerHTML = `<span class="bad">Ссылка на чат ${a.name} должна начинаться с ${a.name === 'Claude' ? 'https://claude.ai/' : 'https://chatgpt.com/'}</span>`; return; }
+      if (fd[k] && !a.ok.test(fd[k])) { $('connState').innerHTML = `<span class="bad">Ссылка на чат ${a.name} должна начинаться с ${a.name === 'Claude' ? 'https://claude.ai/chat/… (адрес чата, не /share/)' : 'https://chatgpt.com/c/… (адрес чата, не /share/)'}</span>`; return; }
     }
     if (!fd.token.trim()) { $('connState').innerHTML = '<span class="bad">Вставьте токен GitHub — без него приложение не видит проекты.</span>'; return; }
     const changed = fd.owner.trim() !== S.settings.owner || fd.repo.trim() !== S.settings.repo;
