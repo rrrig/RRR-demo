@@ -21,6 +21,16 @@ export const partPath = (path, i) => `${path}.part${String(i + 1).padStart(3, '0
 const PART_RE = /\.part(\d{3})$/;
 // Путь части → путь целого файла (или null, если это не часть).
 export const partOf = path => (PART_RE.test(path || '') ? path.replace(PART_RE, '') : null);
+// Манифест большого файла лежит рядом с частями: <путь>.parts.json = { schema, path, name, size, sha256, parts }.
+// По нему файл собирается и проверяется везде (приложение, проверка, компьютер) — без угадывания частей.
+export const MANIFEST_EXT = '.parts.json';
+export const manifestPath = path => path + MANIFEST_EXT;
+export const manifestOf = path => (typeof path === 'string' && path.endsWith(MANIFEST_EXT) ? path.slice(0, -MANIFEST_EXT.length) : null);
+// Часть или манифест → путь целого файла; иначе null.
+export const wholeOf = path => partOf(path) || manifestOf(path);
+// Запись «file» большого файла в виде манифеста (и обратно — те же поля).
+export const toManifest = f => ({ schema: SCHEMA, path: f.path, name: f.name, size: f.size, sha256: f.sha256, parts: f.parts.map(p => ({ path: p.path, size: p.size, sha256: p.sha256 })) });
+export const sameManifest = (a, b) => JSON.stringify(toManifest(a)) === JSON.stringify(toManifest(b));
 export const fileParts = f => (f && Array.isArray(f.parts) && f.parts.length ? f.parts : null);
 export const FILE_KINDS = Object.freeze(['docs', 'sources', 'chat', 'work']);
 
@@ -295,4 +305,15 @@ export function authorOf(message, fallback = '') {
   if (/claude/i.test(fallback)) return 'Claude';
   if (/chatgpt|openai|codex/i.test(fallback)) return 'ChatGPT';
   return fallback || 'Неизвестно';
+}
+
+// Проверка манифеста <path>.parts.json большого файла.
+export function validateManifest(data, path) {
+  const c = checker(path ? path.split('/').pop() + MANIFEST_EXT : 'манифест');
+  if (!c.isObj(data)) { c.err('', 'ожидается JSON-объект'); return c.errors; }
+  if (data.schema !== SCHEMA) c.err('', `schema должна быть ${SCHEMA}`);
+  if (path && data.path !== path) c.err('', `path должен быть «${path}»`);
+  if (!Array.isArray(data.parts)) c.err('', 'нет списка частей parts');
+  else c.fileRef(data, '');
+  return c.errors;
 }

@@ -2,7 +2,7 @@
 // при открытии и скачивании. Формат записи — model.js (file.parts); проверка в хранилище —
 // tools/validate.mjs. Части обрабатываются по одной, чтобы не держать весь файл в памяти дважды.
 import { Sha256 } from '../sha256.js';
-import { MAX_FILE_BYTES, MAX_TOTAL_BYTES, MAX_PARTS, PART_BYTES, partPath, partOf } from './model.js';
+import { MAX_FILE_BYTES, MAX_TOTAL_BYTES, MAX_PARTS, PART_BYTES, partPath, wholeOf, manifestOf, validateManifest } from './model.js';
 
 const hex = buf => Array.from(new Uint8Array(buf), b => b.toString(16).padStart(2, '0')).join('');
 const sha256Of = async buf => hex(await globalThis.crypto.subtle.digest('SHA-256', buf));
@@ -29,30 +29,38 @@ export async function splitBlob(blob, path, name, onPart, onProgress) {
   return { path, name, size, sha256: whole.digestHex(), parts };
 }
 
-// Собрать файл: getBytes(path) → ArrayBuffer части. Каждая часть сверяется по размеру и sha256
-// (если они известны), результат — Blob (браузер может держать его на диске, а не в памяти).
-export async function assembleParts(parts, getBytes, onProgress) {
-  const pieces = [];
+// Собрать файл строго по манифесту: getBytes(path) → ArrayBuffer части или null.
+// Сверяются: манифест, наличие и порядок всех частей, размер и sha256 каждой части, общий размер
+// и sha256 целого файла. Любое расхождение — ошибка (неполный или испорченный файл не выдаётся).
+export async function assembleParts(manifest, getBytes, onProgress) {
+  const errs = validateManifest(manifest, manifest?.path);
+  if (errs.length) throw new Error('Описание частей файла неверно: ' + errs[0]);
+  const whole = new Sha256(), pieces = [], parts = manifest.parts;
+  let total = 0;
   for (const [i, pt] of parts.entries()) {
     const bytes = await getBytes(pt.path);
     if (!bytes) throw new Error(`Часть ${i + 1} из ${parts.length} не найдена`);
-    if (typeof pt.size === 'number' && bytes.byteLength !== pt.size) throw new Error(`Часть ${i + 1}: размер ${bytes.byteLength} вместо ${pt.size}`);
-    if (pt.sha256 && (await sha256Of(bytes)) !== pt.sha256) throw new Error(`Часть ${i + 1} повреждена (sha256 не совпал)`);
+    if (bytes.byteLength !== pt.size) throw new Error(`Часть ${i + 1}: размер ${bytes.byteLength} вместо ${pt.size}`);
+    if ((await sha256Of(bytes)) !== pt.sha256) throw new Error(`Часть ${i + 1} повреждена (sha256 не совпал)`);
+    whole.update(new Uint8Array(bytes)); total += bytes.byteLength;
     pieces.push(new Blob([bytes]));
     onProgress?.(i + 1, parts.length);
   }
+  if (total !== manifest.size) throw new Error(`Размер собранного файла ${total} вместо ${manifest.size}`);
+  if (whole.digestHex() !== manifest.sha256) throw new Error('Собранный файл не совпал по sha256');
   return new Blob(pieces);
 }
 
-// Пути файлов → логические файлы: части «x.part001…» объединяются в один элемент «x».
+// Пути файлов → логические файлы: части «x.part001…» и манифест «x.parts.json» объединяются в «x».
+// У группы: parts — элементы-части, manifest — элемент манифеста (если есть).
 export function groupParts(items, key = x => x.path) {
   const out = [], byPath = new Map();
   for (const it of items) {
-    const p = key(it), whole = partOf(p);
+    const p = key(it), whole = wholeOf(p);
     if (!whole) { out.push({ path: p, item: it, parts: null }); continue; }
     let g = byPath.get(whole);
-    if (!g) { g = { path: whole, item: it, parts: [] }; byPath.set(whole, g); out.push(g); }
-    g.parts.push(it);
+    if (!g) { g = { path: whole, item: it, parts: [], manifest: null }; byPath.set(whole, g); out.push(g); }
+    if (manifestOf(p)) g.manifest = it; else g.parts.push(it);
   }
   for (const g of byPath.values()) g.parts.sort((a, b) => key(a).localeCompare(key(b)));
   return out;

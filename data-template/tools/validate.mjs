@@ -13,6 +13,7 @@ import path from 'node:path';
 import {
   PROJECT_FILES, APPROVED, MAX_FILE_BYTES, FILE_KINDS, CHAT_DIR,
   validateProject, validateChatMessage, chatFileName, validFilePath, approvalChanges, fileParts,
+  manifestPath, manifestOf, partOf, validateManifest, sameManifest,
 } from './model.js';
 
 const args = process.argv.slice(2);
@@ -99,7 +100,17 @@ async function checkRef(folder, { where, f, kind, owner }, referenced) {
     add(where, `имя файла «${name}» должно начинаться с «${owner}-»`);
   }
   const parts = fileParts(f);
-  if (parts) { await checkParts(where, f, parts, referenced); return; }
+  if (parts) {
+    // Запись в JSON должна совпадать с манифестом рядом с частями.
+    const mp = manifestPath(f.path);
+    referenced.add(mp);
+    const m = await readJson(path.join(root, mp));
+    if (m === undefined) add(where, `нет манифеста «${mp}» (создаётся tools/split-file.mjs)`);
+    else if (m instanceof Error) add(where, `манифест «${mp}»: ${m.message}`);
+    else if (!sameManifest(m, f)) add(where, `запись file не совпадает с манифестом «${mp}»`);
+    await checkParts(where, f, parts, referenced);
+    return;
+  }
   referenced.add(f.path);
   const abs = path.join(root, f.path);
   const st = await exists(abs);
@@ -173,6 +184,22 @@ async function checkFilesDir(folder, dir, where, referenced) {
   const st = await exists(filesRoot);
   if (!st) return;
   if (!st.isDirectory()) { add(where, '«files» должен быть папкой'); return; }
+  // Сначала манифесты больших файлов, на которые нет записи в JSON (рабочие файлы и т.п.):
+  // проверяются сами по себе. Затем — части без манифеста.
+  const kinds = (await listDir(filesRoot)).filter(k => k.isDirectory() && FILE_KINDS.includes(k.name));
+  for (const k of kinds) for (const e of await listDir(path.join(filesRoot, k.name))) {
+    const full = `projects/${folder}/files/${k.name}/${e.name}`, whole = manifestOf(full);
+    if (!whole || referenced.has(full)) continue;
+    referenced.add(full);
+    const m = await readJson(path.join(root, full));
+    const errs = m instanceof Error ? [m.message] : validateManifest(m, whole);
+    if (errs.length) { for (const x of errs) add(`${where} › ${full}`, x); continue; }
+    await checkParts(`${where} › ${full}`, m, m.parts, referenced);
+  }
+  for (const k of kinds) for (const e of await listDir(path.join(filesRoot, k.name))) {
+    const full = `projects/${folder}/files/${k.name}/${e.name}`, whole = partOf(full);
+    if (whole && !referenced.has(full)) add(where, `«${full}» — часть без манифеста «${manifestPath(whole)}» или не указана в нём`);
+  }
   for (const k of await listDir(filesRoot)) {
     if (!k.isDirectory() || !FILE_KINDS.includes(k.name)) {
       add(where, `«files/${k.name}»: в files/ допускаются только папки ${FILE_KINDS.join(', ')}`);

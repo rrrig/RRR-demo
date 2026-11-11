@@ -221,7 +221,7 @@ async function send(op) {
     if (!bytes) throw new Error('Файл для отправки не найден на телефоне');
     return (shas[u.key] = await S.client.createBlob(new Uint8Array(bytes)));
   };
-  await S.client.mutate(`[${op.author || me()}] ${op.label}`, ({ read }) => buildChanges(op.slug, op, read, blobSha));
+  await S.client.mutate(`[${op.author || me()}] ${op.label}`, ({ read, files }) => buildChanges(op.slug, op, read, blobSha, files));
   for (const u of op.uploads || []) {
     const bytes = await C.get('uploads', u.key).catch(() => null);
     if (bytes && shas[u.key]) await C.put('blobs', shas[u.key], bytes).catch(() => {});
@@ -257,13 +257,19 @@ function viewFiles(p) {
 // Файл больше 50 МБ автоматически делится на части по 20 МБ (bigfile.js); uploads — по одной на часть.
 async function stageFile(file, kind, slug, id) {
   const name = (id ? id + '-' : '') + repoName(file.name);
-  const path = `projects/${slug}/files/${kind}/${name}`;
+  return stageAt(file, `projects/${slug}/files/${kind}/${name}`);
+}
+// Большой файл: части + манифест <path>.parts.json (по нему файл собирается и проверяется).
+async function stageAt(file, path) {
   if (needsParts(file.size)) {
     const uploads = [];
     toast(`Готовлю «${file.name}» (${fmtSize(file.size)}) частями по 20 МБ…`);
     const ref = await splitBlob(file, path, file.name, async (part, bytes) => {
       const key = M.newId('u'); await C.put('uploads', key, bytes); uploads.push({ path: part.path, key });
     });
+    const mkey = M.newId('u');
+    await C.put('uploads', mkey, new TextEncoder().encode(JSON.stringify(M.toManifest(ref), null, 2) + '\n').buffer);
+    uploads.push({ path: M.manifestPath(path), key: mkey });
     return { ref, uploads };
   }
   const bytes = await file.arrayBuffer();
@@ -548,37 +554,33 @@ function manualHelp(p, pj) {
 }
 
 // ---- Открытие файлов ----
+// Где сейчас лежит путь: сначала самые новые изменения из очереди на телефоне (они ещё не
+// отправлены, но уже действуют), затем принятая версия. Замена или удаление файла в очереди
+// скрывает его прежнее представление (целый файл, части, манифест).
 function findEntry(path) {
-  const e = S.entries.get(path); if (e) return { sha: e.sha, size: e.size };
-  for (const o of S.outbox) for (const u of o.uploads || []) if (u.path === path) return { key: u.key };
-  return null;
+  const L = M.wholeOf(path) || path;
+  for (let i = S.outbox.length - 1; i >= 0; i--) {
+    const o = S.outbox[i];
+    for (const u of o.uploads || []) if (u.path === path) return { key: u.key };
+    if ((o.replace || []).includes(L) || (o.type === 'deleteFile' && o.path === L)) return null;
+  }
+  const e = S.entries.get(path); return e ? { sha: e.sha, size: e.size } : null;
 }
+const hasFile = path => !!(findEntry(path) || findEntry(M.manifestPath(path)));
 async function partBytes(path) {
   const e = findEntry(path);
   if (!e) return null;
   return e.key ? C.get('uploads', e.key) : blobBytes(e.sha);
 }
-// Запись «file» для пути (документ, источник, вложение чата) — нужна для частей и их sha256.
-function refFor(path) {
-  const p = S.projects.get(path.split('/')[1]); if (!p) return null;
-  const f = viewFiles(p);
-  for (const d of f['documents.json']?.documents || []) for (const r of d.revisions || []) if (r.file?.path === path) return r.file;
-  for (const s of f['sources.json']?.sources || []) if (s.file?.path === path) return s.file;
-  for (const m of p.chat || []) for (const x of m.files || []) if (x.path === path) return x;
-  for (const o of pendingFor(p.slug)) for (const x of o.message?.files || [o.item?.file, ...(o.item?.revisions || []).map(r => r.file)].filter(Boolean)) if (x?.path === path) return x;
-  return null;
-}
 // ArrayBuffer для обычного файла; Blob, собранный из частей, — для большого.
 async function fileBytes(path) {
   const e = findEntry(path);
   if (e) return e.key ? C.get('uploads', e.key) : blobBytes(e.sha);
-  let parts = M.fileParts(refFor(path));
-  if (!parts) {   // запись не найдена (например, рабочий файл) — части по порядку имён
-    parts = [];
-    for (let i = 0; i < M.MAX_PARTS && findEntry(M.partPath(path, i)); i++) parts.push({ path: M.partPath(path, i) });
-  }
-  if (!parts.length) throw new Error('Файл ещё не принят в проект или удалён');
-  return assembleParts(parts, partBytes, (i, n) => { const pg = $('pgF'); if (pg) pg.style.width = (100 * i / n) + '%'; });
+  const mBytes = await partBytes(M.manifestPath(path));
+  if (!mBytes) throw new Error('Файл ещё не принят в проект или удалён');
+  let manifest;
+  try { manifest = JSON.parse(new TextDecoder().decode(mBytes)); } catch { throw new Error('Описание частей файла повреждено'); }
+  return assembleParts(manifest, partBytes, (i, n) => { const pg = $('pgF'); if (pg) pg.style.width = (100 * i / n) + '%'; });
 }
 const mime = ext => ({ pdf: 'application/pdf', jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', webp: 'image/webp', heic: 'image/heic', svg: 'image/svg+xml', txt: 'text/plain', md: 'text/plain', csv: 'text/csv', json: 'application/json', zip: 'application/zip', xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', dxf: 'image/vnd.dxf', stl: 'model/stl', step: 'model/step', stp: 'model/step' }[ext] || 'application/octet-stream');
 async function openFile(path, name, { slug = null, editable = false } = {}) {
@@ -609,13 +611,12 @@ async function openFile(path, name, { slug = null, editable = false } = {}) {
     sheetSubmit = async v => {
       const bytesNew = new TextEncoder().encode(v.content ?? ''); const key = M.newId('u');
       await C.put('uploads', key, bytesNew.buffer);
-      return run(slug, { type: 'writeFile', uploads: [{ path, key }] }, `Изменён файл ${name}`);
+      return run(slug, { type: 'writeFile', uploads: [{ path, key }], replace: [path] }, `Изменён файл ${name}`);
     };
     $('replaceF').onchange = async e => {
       const fl = e.target.files[0]; if (!fl) return;
-      if (fl.size > M.MAX_FILE_BYTES) return toast('Файл больше 50 МБ', true);
-      const key = M.newId('u'); await C.put('uploads', key, await fl.arrayBuffer());
-      if (await run(slug, { type: 'writeFile', uploads: [{ path, key }] }, `Заменён файл ${name}`)) closeSheet();
+      let st; try { st = await stageAt(fl, path); } catch (err) { return toast(err.message, true); }
+      if (await run(slug, { type: 'writeFile', uploads: st.uploads, replace: [path] }, `Заменён файл ${name}`)) closeSheet();
     };
     $('delF').onclick = async () => { if (confirm(`Удалить файл «${name}» из проекта? Он останется в истории GitHub.`) && await run(slug, { type: 'deleteFile', path }, `Удалён файл ${name}`)) closeSheet(); };
   }
@@ -797,8 +798,9 @@ const KIND_NAMES = { work: 'Рабочие файлы', docs: 'Файлы док
 function filesTab(p, f, el) {
   const pend = pendingFor(p.slug).flatMap(o => (o.uploads || []).map(u => ({ path: u.path, pending: true, kind: u.path.split('/')[3] })));
   // Части большого файла показываются одним файлом.
-  const all = groupParts([...p.fileEntries, ...pend.filter(x => !S.entries.has(x.path))])
-    .map(g => g.parts ? { ...g.item, path: g.path, big: true, size: g.parts.reduce((n, x) => n + (x.size || 0), 0), pending: g.parts.some(x => x.pending) } : g.item);
+  // Принятые файлы, которые ещё не заменены и не удалены изменениями из очереди, + ожидающие отправки.
+  const all = groupParts([...p.fileEntries.filter(x => findEntry(x.path)?.sha), ...pend.filter((x, i, arr) => findEntry(x.path)?.key && arr.findIndex(y => y.path === x.path) === i)])
+    .map(g => g.parts ? { ...g.item, path: g.path, big: true, size: g.parts.reduce((n, x) => n + (x.size || 0), 0), pending: [...g.parts, g.manifest].some(x => x?.pending) } : g.item);
   const names = new Map();
   // Имя файла и откуда он: документ, источник или сообщение чата.
   for (const d of f['documents.json']?.documents || []) for (const r of d.revisions || []) if (r.file) names.set(r.file.path, { name: r.file.name, ctx: `${d.name}, ${r.rev}` });
@@ -816,13 +818,13 @@ function filesTab(p, f, el) {
   $('upWork').onchange = async e => {
     const files = [...e.target.files]; if (!files.length) return;
     try {
-      const uploads = [];
+      const uploads = [], replace = [];
       for (const fl of files) {
         const path = `projects/${p.slug}/files/work/${repoName(fl.name)}`;
-        if ((S.entries.has(path) || S.entries.has(M.partPath(path, 0))) && !confirm(`Файл ${fl.name} уже есть. Заменить?`)) continue;
-        const s = await stageFile(fl, 'work', p.slug); uploads.push(...s.uploads);
+        if (hasFile(path) && !confirm(`Файл ${fl.name} уже есть. Заменить?`)) continue;
+        const s = await stageAt(fl, path); uploads.push(...s.uploads); replace.push(path);
       }
-      if (uploads.length) await run(p.slug, { type: 'writeFile', uploads }, `Загружено файлов: ${uploads.length}`);
+      if (replace.length) await run(p.slug, { type: 'writeFile', uploads, replace }, `Загружено файлов: ${replace.length}`);
     } catch (err) { toast(err.message, true); }
   };
   $('newText').onclick = () => sheet('Новый файл', input('name', 'Имя файла', '', 'required placeholder="raschet.txt, programma.nc, zametki.md"') + area('content', 'Содержимое', '', 'style="min-height:40vh;font:13px ui-monospace,Menlo,monospace"'),
