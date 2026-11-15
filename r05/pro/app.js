@@ -589,8 +589,8 @@ window.visualViewport?.addEventListener('resize', () => { if (document.body.clas
 // в буфер готовую команду: в сохранённом рабочем чате — короткое «чат …», в новом чате — полное
 // задание (ИИ там не знает контекста). Ссылка открывается сразу по нажатию, без ожидания буфера.
 const AI = {
-  claude: { name: 'Claude', key: 'claudeUrl', fresh: q => 'https://claude.ai/new?q=' + encodeURIComponent(q), ok: /^https:\/\/claude\.ai\/(chat|code|project)\/[^\s]+$/ },
-  chatgpt: { name: 'ChatGPT', key: 'chatgptUrl', fresh: q => 'https://chatgpt.com/?q=' + encodeURIComponent(q), ok: /^https:\/\/(chatgpt\.com|chat\.openai\.com)\/(c\/|g\/[^/\s]+\/c\/)[^\s]+$/ }
+  claude: { name: 'Claude', key: 'claudeUrl', fresh: q => 'https://claude.ai/new?q=' + encodeURIComponent(q), ok: /^https:\/\/claude\.ai\/(chat|code|project)\/[A-Za-z0-9_-]{6,}\/?$/ },
+  chatgpt: { name: 'ChatGPT', key: 'chatgptUrl', fresh: q => 'https://chatgpt.com/?q=' + encodeURIComponent(q), ok: /^https:\/\/(chatgpt\.com|chat\.openai\.com)\/(c\/|g\/[A-Za-z0-9_-]+\/c\/)[A-Za-z0-9_-]{6,}\/?$/ }
 };
 function callText(p, pj, full) {
   const name = pj?.name || p.slug;
@@ -609,14 +609,16 @@ function copyNow(text) {
     document.body.appendChild(t); t.select(); t.setSelectionRange(0, text.length);
     ok = document.execCommand('copy'); t.remove();
   } catch { ok = false; }
-  if (!ok && navigator.clipboard) navigator.clipboard.writeText(text).catch(() => {});
   return ok;
 }
 function callAi(who, p, pj) {
   const a = AI[who], saved = S.settings[a.key] && a.ok.test(S.settings[a.key]);
-  const ok = copyNow(callText(p, pj, !saved));
-  toast(ok ? (saved ? `Команда скопирована — вставьте в чат ${a.name} и отправьте` : `Задание скопировано — вставьте в ${a.name} и отправьте`)
-    : `Не удалось скопировать: вернитесь и нажмите «Задание» → «Скопировать»`, !ok);
+  const text = callText(p, pj, !saved);
+  const okMsg = saved ? `Команда скопирована — вставьте в чат ${a.name} и отправьте` : `Задание скопировано — вставьте в ${a.name} и отправьте`;
+  const failMsg = `Не удалось скопировать: вернитесь и нажмите «Задание» → «Скопировать»`;
+  if (copyNow(text)) { toast(okMsg); return; }
+  if (navigator.clipboard) navigator.clipboard.writeText(text).then(() => toast(okMsg), () => toast(failMsg, true));
+  else toast(failMsg, true);
 }
 function taskPrompt(p, pj) {
   const repo = `${S.settings.owner}/${S.settings.repo}`;
