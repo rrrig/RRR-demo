@@ -1,7 +1,7 @@
 /* Public test-only guard. No production data import. */
 window.IGNIS_PAYROLL_DEMO = true;
 document.addEventListener('change', function(e){
-  if(e.target?.matches?.('input[type="file"]')){
+  if(e.target?.matches?.('input[type="file"]:not(.profile-file)')){
     e.stopImmediatePropagation();
     e.target.value='';
     alert('В публичную тестовую версию запрещено загружать настоящие зарплатные данные. Используйте только вымышленные записи.');
