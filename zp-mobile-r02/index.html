@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#10243e"><meta name="color-scheme" content="light"><meta name="application-name" content="ИГНИС ПРО · Зарплата"><meta name="apple-mobile-web-app-title" content="ИГНИС · ЗП"><meta name="description" content="Защищённая зарплатная ведомость — приложение ИГНИС ПРО."><link rel="icon" href="./icon-192.png"><link rel="apple-touch-icon" href="./icon-192.png"><link rel="manifest" href="./manifest.webmanifest"><link rel="stylesheet" href="./app.css"><meta name="apple-mobile-web-app-capable" content="yes"><title>ИГНИС ПРО — ЗП • Тест на iPhone</title><style>
+#restore-encrypted,#replace-archive,#restore-cloud,#connect-cloud,#import-json {display:none!important;}
+.test-ribbon {display:block;background:#fff6db;border-bottom:2px solid #c88a07;color:#6d4700;padding:8px 12px;text-align:center;font:600 13px/1.3 system-ui,-apple-system,sans-serif;}
+</style>
+</head>
+<body><div class="test-ribbon">ТЕСТОВАЯ ВЕРСИЯ · Только вымышленные сотрудники · Не загружайте реальные зарплатные данные</div>
+<div id="vault-gate"><div class="gate-card"><div class="gate-brand"><div class="gate-mark">ЗП</div><div><div class="gate-title">ИГНИС ПРО</div><div class="gate-muted">Защищённая зарплатная ведомость</div></div></div><p>Подготовка защищённого хранилища…</p></div></div>
+<div class="sessionbar" id="sessionbar" hidden><span id="cloud-status" class="status">Локальное шифрование</span><button id="backup-protected" type="button">Зашифрованная копия</button><button id="connect-cloud" type="button">Синхронизировать</button><button id="lock-app" type="button">Заблокировать</button></div>
+<div class="app" id="app" hidden></div><div id="modal-root"></div><div id="toast" class="toast" role="status" aria-live="polite"></div>
+<script src="./test-guard.js" defer></script>
+<script src="./seed.js" defer></script><script src="./core.js" defer></script><script src="./exportxlsx.js" defer></script><script src="./vault.js" defer></script><script src="./app.js" defer></script><script src="./boot.js" defer></script>
+</body></html>
